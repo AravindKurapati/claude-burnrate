@@ -1,4 +1,4 @@
-# SPEC.md — Features to implement
+# SPEC.md - Features to implement
 
 Read CLAUDE.md first for project conventions before touching any code.
 
@@ -32,7 +32,7 @@ claude-burnrate week
 ### Edge cases
 - If fewer than 2 days of data: show "not enough data yet, check back tomorrow"
 - If no sessions at all: show "no sessions tracked this week"
-- Never divide by zero — guard elapsed_days with max(elapsed_days, 0.1)
+- Never divide by zero - guard elapsed_days with max(elapsed_days, 0.1)
 
 ### Plan values (already in PLAN_WEEKLY_SESSIONS dict)
 - pro: 10 sessions/week
@@ -72,7 +72,7 @@ Where:
   - done = duration >= 4h
 
 ### Output
-- Write the CSV using Python stdlib `csv` module — no pandas
+- Write the CSV using Python stdlib `csv` module - no pandas
 - Print a Rich panel confirming: filename, row count, date range covered
 - If no sessions found for the date range: print a warning and exit cleanly
 
@@ -108,128 +108,137 @@ This script should:
 ```
 
 ### Notes
-- Keep it simple — no error handling beyond try/catch on the start command
+- Keep it simple - no error handling beyond try/catch on the start command
 - The alias replaces `claude` so every `claude` invocation auto-tracks
-- Do not auto-end silently — always prompt for message count so data is useful
+- Do not auto-end silently - always prompt for message count so data is useful
 
 ---
 
 ## Feature 4: `estimate` command
 
-### What it does
-Estimates how many questions you have left in the current session window,
-broken down by message size (small / medium / large).
+Add @app.command("estimate") to cli.py.
 
-This is an approximation — Anthropic does not expose token counts on claude.ai.
-The estimate is based on: session time remaining, your historical message rate,
-message size multipliers, and a peak-hour drain penalty.
+### What it does
+Estimates questions remaining in the current session window, broken down
+by message size (small / medium / large) and by model (Sonnet / Opus).
+Shows a 3x2 grid: 3 sizes × 2 models.
 
 ### Command signature
-```
-claude-burnrate estimate
-claude-burnrate estimate --size small
-claude-burnrate estimate --size medium
-claude-burnrate estimate --size large
-```
+    claude-burnrate estimate
+    claude-burnrate estimate --size small
+    claude-burnrate estimate --size large
 
 ### Options
-- `--size` / `-s`: filter output to one size tier (default: show all three)
+- `--size` / `-s`: filter to one size row only (default: show all three)
 
-### Message size definitions
-These are the token cost tiers. Show these definitions in the output so users
-understand what "small" means without needing to check the docs.
+### Size definitions and cost multipliers
+These are relative cost units, not real tokens. Opus costs ~5x Sonnet
+at the same task size.
 
-| Size   | What it means                                              | Relative cost |
-|--------|------------------------------------------------------------|---------------|
-| small  | Quick question, yes/no, short clarification (<50 words)    | 1x            |
-| medium | Explain a concept, review ~50 lines of code, write a para  | 3x            |
-| large  | Full file review, long doc, agentic task, deep research    | 8x            |
+Size   | What it means                               | Sonnet cost | Opus cost
+-------|---------------------------------------------|-------------|----------
+small  | Quick question, yes/no, clarification       | 1x          | 5x
+medium | Explain concept, ~50 lines code, write para | 3x          | 15x
+large  | Full file review, agentic task, deep research| 8x         | 40x
 
-### Core calculation
+### Calculation steps
 
-Step 1: get time remaining in session
-```
-active session → SESSION_HOURS - elapsed_hours = time_remaining_hrs
-no active session → SESSION_HOURS (full window available)
-```
+Step 1 - time remaining
+    If active session: SESSION_HOURS - elapsed_hours
+    If no active session: SESSION_HOURS (full window)
 
-Step 2: get historical messages/hour from the last 7 days of completed sessions
-```
-avg_msgs_per_hr = total_messages / total_duration_hrs
-fallback if no history: use 10 messages/hour as a conservative default
-```
+Step 2 - historical message rate
+    avg_msgs_per_hr = sum(messages) / sum(duration_hrs)
+    across all completed sessions in last 7 days
+    Fallback if no history: 10 msg/hr
+    Note in output which one is being used
 
-Step 3: apply peak hour penalty
-```
-if _is_peak(now): effective_time = time_remaining_hrs * 0.75
-else:             effective_time = time_remaining_hrs
-```
-The 0.75 factor reflects that sessions drain ~25-33% faster during peak hours
-(Anthropic confirmed faster drain in March 2026 but did not publish exact multiplier).
-Show this adjustment in the output when it applies.
+Step 3 - peak hour penalty
+    if _is_peak(now): effective_time = time_remaining * 0.75
+    else: effective_time = time_remaining
+    Show this adjustment as a visible line when it applies
 
-Step 4: calculate base capacity
-```
-base_capacity = effective_time * avg_msgs_per_hr
-```
+Step 4 - base capacity
+    base_capacity = effective_time * avg_msgs_per_hr
 
-Step 5: apply size multiplier
-```
-questions_remaining_small  = base_capacity / 1
-questions_remaining_medium = base_capacity / 3
-questions_remaining_large  = base_capacity / 8
-```
-
-Round all results to nearest integer. Floor at 0 — never show negative.
+Step 5 - estimates per cell
+    questions = floor(base_capacity / cost_multiplier)
+    Floor at 0. Never negative.
 
 ### Output format
-Show a Rich panel with three sections:
+Rich panel with three sections:
 
-Section 1 — Session context:
-- Time remaining in window (or "no active session — full 5h window available")
-- Avg messages/hour from your history (or "using default: 10 msg/hr — no history yet")
-- Peak hour warning if applicable
+Section 1 - context line:
+    "Active session: 3.2h remaining" OR "No active session - full 5h available"
+    "Your rate: 14.3 msg/hr (7-day history)" OR "Using default: 10 msg/hr (no history yet)"
+    If peak: " Peak hours - effective time reduced to X.Xh (0.75x penalty)"
 
-Section 2 — Estimates table (Rich Table inside the panel):
-```
-Size     What it means                    Est. questions remaining
-------   ------------------------------   -----------------------
-Small    Quick question / clarification   ~142
-Medium   Concept / code review / para     ~47
-Large    File review / agentic / research ~17
-```
+Section 2 - estimates table (Rich Table):
+    Size     What it means                      Sonnet    Opus
+    ------   --------------------------------   -------   ------
+    Small    Quick question / clarification     ~142      ~28
+    Medium   Concept / code review / para       ~47       ~9
+    Large    File review / agentic / research   ~17       ~3
 
-Section 3 — One-line caveat at the bottom:
-"These are estimates based on your usage history. Actual limits depend on
-message complexity, features used, and Anthropic's capacity management."
+Section 3 - one-line caveat:
+    "Estimates based on your usage history. Actual limits depend on
+    message complexity, features used, and Anthropic's capacity management."
 
 ### Edge cases
-- No active session: use full SESSION_HOURS as time_remaining, note this in output
-- No message history: use fallback of 10 msg/hr, note this in output
-- Peak hours: show the 0.75x adjustment as a visible line ("⚡ Peak hour penalty applied: effective time reduced to X.Xh")
-- All sizes result in 0: show "session window likely exhausted — start a fresh session"
+- No active session: use full SESSION_HOURS, note in output
+- No message history: use 10 msg/hr fallback, note in output
+- --size filter: show only that row in the table, all other output unchanged
+- All values are 0: show "Session window likely exhausted - start a fresh session"
 
-### Where this fits in the CLI
-Add `estimate` as a subcommand in cli.py alongside the others.
-It does not require an active session — it works without one (uses full window).
-It reads from the DB for history but does not write anything.
+### Tests to write in test_cli.py
+- test_estimate_no_history - fallback rate used, full window, all 6 cells present
+- test_estimate_with_active_session - time_remaining < SESSION_HOURS
+- test_estimate_peak_penalty - mock _is_peak to return True, verify Opus/Sonnet
+  values are lower than off-peak equivalents
+- test_estimate_size_filter - --size large shows only large row
 
-### Testing
-- Run with no sessions in DB → should show fallback rate, full window
-- Run during peak hours (mock by temporarily changing PEAK_START_PT) → should show penalty
-- Run with an active session that has 2h remaining → verify numbers scale correctly
-- Run with --size large → should show only the large row, not all three
+---
+
+## Feature 5: project tagging + project history filter
+
+### What it does
+Lets users tag sessions with a project name so they can track total
+effort (messages + token estimates) across a multi-session build.
+
+### Two parts
+
+Part A - add --project option to `start` command
+    claude-burnrate start --label "auth refactor" --task coding --project burnrate-build
+
+- Add `project` TEXT column to the sessions table (nullable, default NULL)
+- Migration: on _db() startup, run:
+    ALTER TABLE sessions ADD COLUMN project TEXT DEFAULT NULL
+  Wrap in try/except - this is a no-op if the column already exists
+- Add --project / -p option to start_session()
+- Store it in the DB with the session
+
+Part B - add --project filter to `history` command
+    claude-burnrate history --project burnrate-build
+    claude-burnrate history --project burnrate-build --days 30
+
+- Add --project / -p option to history()
+- If provided: filter sessions WHERE project = ? in the query
+- At the bottom of the table, add a summary line:
+    "Project total: X sessions, Y messages, ~Z tokens est."
+- If no sessions match: print yellow warning "No sessions found for project '<name>'"
+
+### Tests to write in test_cli.py
+- test_project_tag_stored - start with --project, verify column in DB
+- test_project_history_filter - 3 sessions, 2 tagged same project, filter returns 2
+- test_project_history_summary_line - verify totals line appears
+- test_project_history_no_match - warning shown for unknown project name
+- test_db_migration - verify ALTER TABLE is safe to run twice (no crash)
 
 ---
 
 ## Implementation order
-1. `week` command — pure logic, no new dependencies
-2. `export` command — stdlib csv only, no pandas
-3. PowerShell hook — new file in shell/ folder, no changes to cli.py
-4. `estimate` command — read-only, no new dependencies
+1. Feature 4 (estimate) - no schema changes, read-only
+2. Feature 5 (project tagging) - schema migration first, then commands
 
-## Testing each feature after implementation
-- `week`: run with 0 sessions, 1 session, 3+ sessions — check all edge cases render correctly
-- `export`: run with --days 7, check CSV opens in Excel, verify columns match spec
-- Hook: read through the ps1 file to verify alias and prompt logic
-- `estimate`: run with no history, with history, during peak hours, with --size filter
+Show me Feature 4 output before starting Feature 5.
+Do not commit either feature - show me first.

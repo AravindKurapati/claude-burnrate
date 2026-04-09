@@ -39,7 +39,7 @@ claude-burnrate/
 - Do not rename existing commands — users may have these aliased
 
 ## Current commands
-start, end, status, history, advice, config, reset
+start, end, status, history, week, estimate, export, advice, config, reset
 
 ## Adding new commands
 Add as @app.command() functions in cli.py.

@@ -93,10 +93,13 @@ claude-budget config --show
 
 | Command | What it does |
 |---------|-------------|
-| `start` | Begin tracking a new session |
+| `start` | Begin tracking a new session (`--project` to tag) |
 | `end` | Close session, log messages + token estimate |
 | `status` | Current session + weekly budget at a glance |
-| `history` | Session log for last N days |
+| `history` | Session log for last N days (`--project` to filter) |
+| `week` | Project end-of-week budget based on burn pace |
+| `estimate` | Estimate questions remaining by size and model |
+| `export` | Export session history to CSV |
 | `advice` | Personalised tips based on your usage patterns |
 | `config` | Set plan and timezone |
 | `reset` | Wipe history (keeps config) |
