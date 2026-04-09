@@ -153,7 +153,7 @@ class TestExportCommand:
         result = runner.invoke(cli_mod.app, ["export", "--output", str(custom_path)])
         assert result.exit_code == 0
         assert custom_path.exists()
-        assert "my_sessions.csv" in result.output or str(custom_path) in result.output
+        assert "my_sessions.csv" in str(result.output).strip() or str(custom_path) in str(result.output).strip()
 
 
 # ── estimate command tests ──────────────────────────────────────────────────
