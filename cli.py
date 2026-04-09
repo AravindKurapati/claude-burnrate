@@ -4,7 +4,9 @@ claude-burnrate: Track your Claude session and weekly usage so you never waste l
 
 import typer
 import json
+import csv
 import sqlite3
+from math import floor
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
@@ -69,6 +71,11 @@ def _db() -> sqlite3.Connection:
             value TEXT
         )
     """)
+    # Migration: add project column if missing
+    try:
+        conn.execute("ALTER TABLE sessions ADD COLUMN project TEXT DEFAULT NULL")
+    except sqlite3.OperationalError:
+        pass  # column already exists
     conn.commit()
     return conn
 
@@ -141,6 +148,21 @@ PLAN_WEEKLY_SESSIONS = {
     "max_20x": 200,
 }
 
+# Relative cost multipliers for estimate command (Opus ~ 5x Sonnet)
+ESTIMATE_COSTS = {
+    "small":  {"sonnet": 1,  "opus": 5},
+    "medium": {"sonnet": 3,  "opus": 15},
+    "large":  {"sonnet": 8,  "opus": 40},
+}
+
+ESTIMATE_SIZE_DESC = {
+    "small":  "Quick question / clarification",
+    "medium": "Concept / code review / para",
+    "large":  "File review / agentic / research",
+}
+
+DEFAULT_MSG_RATE = 10  # fallback msg/hr when no history
+
 # ── Commands ──────────────────────────────────────────────────────────────────
 
 @app.command("start")
@@ -148,6 +170,7 @@ def start_session(
     label: str = typer.Option("", "--label", "-l", help="What you're working on"),
     task: str = typer.Option("", "--task", "-t", help="Task type (coding/research/writing/other)"),
     notes: str = typer.Option("", "--notes", "-n", help="Any notes"),
+    project: str = typer.Option("", "--project", "-p", help="Project name for grouping sessions"),
 ):
     """Start a new Claude session and begin tracking it."""
     conn = _db()
@@ -171,14 +194,14 @@ def start_session(
     peak = _is_peak(now, cfg.get("timezone_offset", 0))
 
     conn.execute(
-        "INSERT INTO sessions (started_at, label, task_type, notes, peak_hour) VALUES (?,?,?,?,?)",
-        (now.isoformat(), label or "unlabeled", task or "general", notes, int(peak))
+        "INSERT INTO sessions (started_at, label, task_type, notes, peak_hour, project) VALUES (?,?,?,?,?,?)",
+        (now.isoformat(), label or "unlabeled", task or "general", notes, int(peak), project or None)
     )
     conn.commit()
 
     peak_warning = ""
     if peak:
-        peak_warning = "\n[red bold]⚡ PEAK HOURS[/red bold] (5am-11am PT) — sessions drain [bold]faster[/bold] right now. Consider waiting."
+        peak_warning = "\n[red bold]⚡ PEAK HOURS[/red bold] (5am-11am PT) - sessions drain [bold]faster[/bold] right now. Consider waiting."
 
     sessions_this_week = _sessions_this_week(conn)
     plan_sessions = PLAN_WEEKLY_SESSIONS.get(cfg["plan"], 50)
@@ -287,9 +310,9 @@ def status(verbose: bool = typer.Option(False, "--verbose", "-v")):
         pt_now = _to_pt(now)
         peak_now = _is_peak(now, cfg.get("timezone_offset", 0))
         peak_msg = (
-            f"[red]⚡ PEAK HOURS now (5am-11am PT) — sessions drain faster[/red]"
+            f"[red]⚡ PEAK HOURS now (5am-11am PT) - sessions drain faster[/red]"
             if peak_now else
-            f"[green]✓ Off-peak now — good time to start a heavy session[/green]"
+            f"[green]✓ Off-peak now - good time to start a heavy session[/green]"
         )
         console.print(Panel(
             f"No active session.\n{peak_msg}\n"
@@ -301,7 +324,7 @@ def status(verbose: bool = typer.Option(False, "--verbose", "-v")):
     # ── Weekly budget panel ──────────────────────────────────────
     waste_line = ""
     if wasted_hrs > 0.1:
-        waste_line = f"\n[red]⚠ Wasted:[/red] ~[bold]{wasted_hrs:.1f}h[/bold] across {len(wasted)} short sessions — time you paid for but didn't use"
+        waste_line = f"\n[red]Wasted:[/red] ~[bold]{wasted_hrs:.1f}h[/bold] across {len(wasted)} short sessions - time you paid for but didn't use"
 
     console.print(Panel(
         f"Plan: [bold]{PLAN_LABELS.get(plan, plan)}[/bold]\n"
@@ -309,7 +332,7 @@ def status(verbose: bool = typer.Option(False, "--verbose", "-v")):
         f"Messages (7d): [cyan]{total_msgs:,}[/cyan]  |  Tokens est: [cyan]{total_tokens:,}[/cyan]\n"
         f"Peak: [red]{peak_sessions}[/red] sessions  |  Off-peak: [green]{offpeak_sessions}[/green] sessions"
         + waste_line,
-        title="📊 Weekly Budget", border_style="blue"
+        title="Weekly Budget", border_style="blue"
     ))
 
     if verbose:
@@ -317,19 +340,43 @@ def status(verbose: bool = typer.Option(False, "--verbose", "-v")):
 
 
 @app.command("history")
-def history(days: int = typer.Option(7, "--days", "-d", help="How many days back to show")):
+def history(
+    days: int = typer.Option(7, "--days", "-d", help="How many days back to show"),
+    project: str = typer.Option("", "--project", "-p", help="Filter by project name"),
+):
     """Show session history."""
     conn = _db()
     cutoff = (_now_utc() - timedelta(days=days)).isoformat()
-    sessions = conn.execute(
-        "SELECT * FROM sessions WHERE started_at > ? ORDER BY started_at DESC", (cutoff,)
-    ).fetchall()
+
+    if project:
+        sessions = conn.execute(
+            "SELECT * FROM sessions WHERE started_at > ? AND project = ? ORDER BY started_at DESC",
+            (cutoff, project)
+        ).fetchall()
+    else:
+        sessions = conn.execute(
+            "SELECT * FROM sessions WHERE started_at > ? ORDER BY started_at DESC", (cutoff,)
+        ).fetchall()
 
     if not sessions:
-        console.print(f"[dim]No sessions in the last {days} days.[/dim]")
+        if project:
+            console.print(f"[yellow]No sessions found for project '{project}'[/yellow]")
+        else:
+            console.print(f"[dim]No sessions in the last {days} days.[/dim]")
         return
 
-    _show_session_table(sessions, title=f"Sessions — last {days} days")
+    title = f"Sessions - last {days} days"
+    if project:
+        title += f" - project: {project}"
+    _show_session_table(sessions, title=title)
+
+    if project:
+        total_msgs = sum(s["messages"] or 0 for s in sessions)
+        total_tokens = sum(s["tokens_est"] or 0 for s in sessions)
+        console.print(
+            f"\n[bold]Project total:[/bold] {len(sessions)} sessions, "
+            f"{total_msgs} messages, ~{total_tokens:,} tokens est."
+        )
 
 
 @app.command("advice")
@@ -351,7 +398,7 @@ def advice():
     if wasted_hrs > 2:
         tips.append(
             f"[red]● Short sessions:[/red] You left ~{wasted_hrs:.1f}h unused across {len(wasted)} sessions. "
-            "Front-load heavier tasks — start with the most token-hungry work so each 5h window is fully used."
+            "Front-load heavier tasks - start with the most token-hungry work so each 5h window is fully used."
         )
 
     if peak_sessions > total * 0.5 and total > 3:
@@ -375,7 +422,7 @@ def advice():
     # General structural tips
     tips.append(
         "[blue]● Context hygiene:[/blue] Use [bold]/clear[/bold] between unrelated tasks within a session "
-        "rather than ending the session — you keep your 5h window running without burning a new one."
+        "rather than ending the session - you keep your 5h window running without burning a new one."
     )
     tips.append(
         "[blue]● Batch your messages:[/blue] Group related questions into single messages. "
@@ -392,10 +439,215 @@ def advice():
     ))
 
 
+@app.command("week")
+def week():
+    """Project your end-of-week budget based on current burn pace."""
+    conn = _db()
+    cfg = _load_config()
+    now = _now_utc()
+
+    sessions = _sessions_this_week(conn)
+
+    if not sessions:
+        console.print(Panel(
+            "No sessions tracked this week.\n"
+            "Run [bold]claude-burnrate start[/bold] to begin tracking.",
+            title="Weekly Projection", border_style="dim"
+        ))
+        return
+
+    # Calculate days elapsed since oldest session this week
+    oldest_start = datetime.fromisoformat(sessions[0]["started_at"])
+    elapsed_days = (now - oldest_start).total_seconds() / 86400
+    elapsed_days = max(elapsed_days, 0.1)  # guard against division by zero
+
+    if elapsed_days < 2:
+        console.print(Panel(
+            f"Not enough data yet - only {elapsed_days:.1f} day(s) tracked.\n"
+            "Check back tomorrow for a meaningful projection.",
+            title="Weekly Projection", border_style="dim"
+        ))
+        return
+
+    total_used = len(sessions)
+    avg_per_day = total_used / elapsed_days
+
+    # Project total by reset (7 days from first session)
+    days_until_reset = max(0, 7 - elapsed_days)
+    projected_total = total_used + avg_per_day * days_until_reset
+
+    plan = cfg.get("plan", "max_5x")
+    plan_ceiling = PLAN_WEEKLY_SESSIONS.get(plan, 50)
+    projected_remaining = max(0, plan_ceiling - projected_total)
+
+    pct_projected = projected_total / plan_ceiling * 100
+
+    warning = ""
+    if pct_projected > 80:
+        warning = (
+            f"\n[red bold]⚠ Warning:[/red bold] At this pace you'll use "
+            f"~{projected_total:.0f}/{plan_ceiling} sessions ({pct_projected:.0f}%) by reset day."
+        )
+
+    console.print(Panel(
+        f"[bold]Sessions used so far:[/bold] [cyan]{total_used}[/cyan]\n"
+        f"[bold]Average sessions/day:[/bold] [cyan]{avg_per_day:.1f}[/cyan]\n"
+        f"[bold]Projected total by reset:[/bold] [cyan]{projected_total:.0f}[/cyan] / {plan_ceiling}\n"
+        f"[bold]Sessions remaining (projected):[/bold] [cyan]{projected_remaining:.0f}[/cyan]\n"
+        f"[bold]Days until weekly reset:[/bold] [cyan]{days_until_reset:.1f}[/cyan]"
+        + warning,
+        title="Weekly Projection", border_style="blue"
+    ))
+
+
+@app.command("export")
+def export_cmd(
+    days: int = typer.Option(30, "--days", "-d", help="How many days back to export"),
+    output: Optional[str] = typer.Option(None, "--output", "-o", help="Output CSV path"),
+):
+    """Export session history to a CSV file."""
+    conn = _db()
+    cutoff = (_now_utc() - timedelta(days=days)).isoformat()
+    sessions = conn.execute(
+        "SELECT * FROM sessions WHERE started_at > ? ORDER BY started_at ASC", (cutoff,)
+    ).fetchall()
+
+    if not sessions:
+        console.print(f"[yellow]No sessions found in the last {days} days. Nothing to export.[/yellow]")
+        return
+
+    if output is None:
+        output = f"burnrate_export_{_now_utc().strftime('%Y%m%d')}.csv"
+
+    out_path = Path(output)
+    columns = ["id", "label", "task_type", "started_at", "ended_at",
+               "duration_hrs", "messages", "tokens_est", "peak_hour", "notes", "status"]
+
+    with open(out_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(columns)
+        for s in sessions:
+            if s["ended_at"]:
+                dur = _session_duration_hrs(s)
+                dur_str = f"{dur:.2f}"
+                status = "short" if dur < 4 else "done"
+            else:
+                dur_str = ""
+                status = "active"
+
+            writer.writerow([
+                s["id"],
+                s["label"] or "",
+                s["task_type"] or "",
+                s["started_at"],
+                s["ended_at"] or "",
+                dur_str,
+                s["messages"] or 0,
+                s["tokens_est"] or 0,
+                s["peak_hour"],
+                s["notes"] or "",
+                status,
+            ])
+
+    # Date range for display
+    first_date = sessions[0]["started_at"][:10]
+    last_date = sessions[-1]["started_at"][:10]
+
+    console.print(Panel(
+        f"[green bold]Exported {len(sessions)} sessions[/green bold]\n"
+        f"File: [cyan]{out_path}[/cyan]\n"
+        f"Date range: {first_date} -> {last_date}",
+        title="CSV Export", border_style="green"
+    ))
+
+
+@app.command("estimate")
+def estimate(
+    size: Optional[str] = typer.Option(None, "--size", "-s", help="Filter to one size: small | medium | large"),
+):
+    """Estimate questions remaining in the current session window."""
+    conn = _db()
+    cfg = _load_config()
+    now = _now_utc()
+
+    # Step 1 - time remaining
+    active = _active_session(conn)
+    if active:
+        elapsed = _session_duration_hrs(active)
+        time_remaining = max(0, SESSION_HOURS - elapsed)
+        time_line = f"Active session: [cyan]{time_remaining:.1f}h[/cyan] remaining"
+    else:
+        time_remaining = SESSION_HOURS
+        time_line = f"No active session - full [cyan]{SESSION_HOURS}h[/cyan] available"
+
+    # Step 2 - historical message rate
+    sessions_week = _sessions_this_week(conn)
+    completed = [s for s in sessions_week if s["ended_at"]]
+    total_msgs = sum(s["messages"] for s in completed)
+    total_dur = sum(_session_duration_hrs(s) for s in completed)
+
+    if total_dur > 0 and total_msgs > 0:
+        avg_msgs_per_hr = total_msgs / total_dur
+        rate_line = f"Your rate: [cyan]{avg_msgs_per_hr:.1f}[/cyan] msg/hr (7-day history)"
+    else:
+        avg_msgs_per_hr = DEFAULT_MSG_RATE
+        rate_line = f"Using default: [cyan]{DEFAULT_MSG_RATE}[/cyan] msg/hr (no history yet)"
+
+    # Step 3 - peak hour penalty
+    peak_line = ""
+    if _is_peak(now, cfg.get("timezone_offset", 0)):
+        effective_time = time_remaining * 0.75
+        peak_line = f"\n[red bold]Peak hours[/red bold] - effective time reduced to [cyan]{effective_time:.1f}h[/cyan] (0.75x penalty)"
+    else:
+        effective_time = time_remaining
+
+    # Step 4 - base capacity
+    base_capacity = effective_time * avg_msgs_per_hr
+
+    # Check if session exhausted
+    if base_capacity <= 0:
+        console.print(Panel(
+            "Session window likely exhausted - start a fresh session.",
+            title="Estimate", border_style="dim"
+        ))
+        return
+
+    # Step 5 - build estimates table
+    sizes_to_show = [size] if size and size in ESTIMATE_COSTS else list(ESTIMATE_COSTS.keys())
+
+    table = Table(box=box.SIMPLE_HEAVY, show_lines=False)
+    table.add_column("Size", style="bold", width=8)
+    table.add_column("What it means", style="dim", min_width=30)
+    table.add_column("Sonnet", justify="right", style="cyan", width=8)
+    table.add_column("Opus", justify="right", style="cyan", width=8)
+
+    for sz in sizes_to_show:
+        costs = ESTIMATE_COSTS[sz]
+        sonnet_est = floor(base_capacity / costs["sonnet"])
+        opus_est = floor(base_capacity / costs["opus"])
+        table.add_row(
+            sz.capitalize(),
+            ESTIMATE_SIZE_DESC[sz],
+            f"~{sonnet_est}",
+            f"~{opus_est}",
+        )
+
+    # Assemble output
+    context = f"{time_line}\n{rate_line}{peak_line}"
+    caveat = "[dim]Estimates based on your usage history. Actual limits depend on message complexity, features used, and Anthropic's capacity management.[/dim]"
+
+    console.print(Panel(
+        f"{context}\n",
+        title="Estimate", border_style="cyan"
+    ))
+    console.print(table)
+    console.print(f"\n{caveat}")
+
+
 @app.command("config")
 def config_cmd(
     plan: Optional[str] = typer.Option(None, "--plan", "-p", help="pro | max_5x | max_20x"),
-    tz_offset: Optional[int] = typer.Option(None, "--tz", help="Hours ahead of PT (ET=3, GMT=8, IST=13.5→14)"),
+    tz_offset: Optional[int] = typer.Option(None, "--tz", help="Hours ahead of PT (ET=3, GMT=8, IST=13.5->14)"),
     show: bool = typer.Option(False, "--show", "-s", help="Show current config"),
 ):
     """View or update your plan config."""
@@ -465,7 +717,7 @@ def _show_session_table(sessions: list, title: str = "Sessions"):
             else "[red]short[/red]" if dur < SESSION_HOURS - 1.0
             else "[dim]done[/dim]"
         )
-        peak_str = "[red]⚡[/red]" if s["peak_hour"] else "[green]✓[/green]"
+        peak_str = "[red]●[/red]" if s["peak_hour"] else "[green]✓[/green]"
         table.add_row(
             str(i),
             s["label"] or "-",
