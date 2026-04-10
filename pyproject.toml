@@ -10,7 +10,7 @@ readme = "Readme.md"
 requires-python = ">=3.9"
 license = {text = "MIT"}
 authors = [
-  {name = "Aravind Kurapati", email = ""},
+  {name = "Aravind Kurapati"},
 ]
 keywords = ["claude", "anthropic", "usage", "cli", "limits", "budget"]
 classifiers = [
