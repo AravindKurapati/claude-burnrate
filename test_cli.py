@@ -504,3 +504,81 @@ class TestSyncCommand:
         result = runner.invoke(cli_mod.app, ["plan"])
         assert result.exit_code == 0
         assert "last sync" in result.output.lower()
+
+
+# ── optimize command tests ─────────────────────────────────────────────────
+
+class TestOptimizeCommand:
+    def test_optimize_no_sessions_left(self, tmp_path):
+        """0 remaining shows budget exhausted message."""
+        _setup_test_db(tmp_path)
+        result = runner.invoke(cli_mod.app, ["optimize", "--sessions", "0"])
+        assert result.exit_code == 0
+        assert "no sessions remaining" in result.output.lower() or "budget" in result.output.lower()
+
+    def test_optimize_two_sessions_fit(self, tmp_path):
+        """2 sessions with enough time shows 2 slots."""
+        conn = _setup_test_db(tmp_path)
+        now = datetime.now(timezone.utc)
+        # Set reset far enough in the future (3 days)
+        reset_day = now + timedelta(days=3)
+        day_name = reset_day.strftime("%a")
+        reset_str = f"{day_name} 9:00 AM"
+        result = runner.invoke(cli_mod.app, [
+            "optimize", "--sessions", "2", "--resets", reset_str
+        ])
+        assert result.exit_code == 0
+        # Should show two numbered slots
+        assert " 1 " in result.output
+        assert " 2 " in result.output
+
+    def test_optimize_peak_avoidance(self, tmp_path):
+        """Candidate during peak hours gets pushed to after peak."""
+        conn = _setup_test_db(tmp_path)
+        # Mock now to be a weekday during peak (8am PT = 3pm UTC)
+        mock_now = datetime(2026, 4, 13, 15, 0, 0, tzinfo=timezone.utc)  # Monday 3pm UTC = 8am PT
+        reset_time = mock_now + timedelta(days=3)
+
+        with patch.object(cli_mod, '_now_utc', return_value=mock_now):
+            day_name = reset_time.strftime("%a")
+            result = runner.invoke(cli_mod.app, [
+                "optimize", "--sessions", "1", "--resets", f"{day_name} 9:00 AM"
+            ])
+        assert result.exit_code == 0
+        # Should have IDEAL rating (pushed past peak)
+        assert "IDEAL" in result.output
+
+    def test_optimize_feasibility_cap(self, tmp_path):
+        """5 sessions requested but only 2h until reset, capped to 0."""
+        conn = _setup_test_db(tmp_path)
+        now = datetime.now(timezone.utc)
+        # Reset in 2 hours — can't fit any 5h session
+        reset_time = now + timedelta(hours=2)
+        with patch.object(cli_mod, '_now_utc', return_value=now):
+            with patch.object(cli_mod, '_parse_weekly_reset', return_value=reset_time):
+                result = runner.invoke(cli_mod.app, [
+                    "optimize", "--sessions", "5", "--resets", "Mon 9:00 AM"
+                ])
+        assert result.exit_code == 0
+        assert "not enough time" in result.output.lower() or "fit at most 0" in result.output.lower()
+
+    def test_optimize_sessions_flag(self, tmp_path):
+        """--sessions 3 overrides DB calculation."""
+        conn = _setup_test_db(tmp_path)
+        now = datetime.now(timezone.utc)
+        reset_time = now + timedelta(days=5)
+        day_name = reset_time.strftime("%a")
+        result = runner.invoke(cli_mod.app, [
+            "optimize", "--sessions", "3", "--resets", f"{day_name} 9:00 AM"
+        ])
+        assert result.exit_code == 0
+        assert "3 sessions remaining" in result.output
+
+    def test_optimize_resets_flag(self, tmp_path):
+        """--resets 'Sat 9:00 AM' used as reset time."""
+        conn = _setup_test_db(tmp_path)
+        result = runner.invoke(cli_mod.app, [
+            "optimize", "--sessions", "2", "--resets", "Sat 9:00 AM"
+        ])
+        assert result.exit_code == 0
+        assert "Sat" in result.output

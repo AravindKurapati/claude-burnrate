@@ -1088,7 +1088,219 @@ def reset(confirm: bool = typer.Option(False, "--yes", "-y", help="Skip confirma
     console.print("[green]Session history cleared.[/green]")
 
 
+@app.command("optimize")
+def optimize_cmd(
+    sessions: Optional[int] = typer.Option(None, "--sessions", "-s", help="Override sessions remaining"),
+    resets: Optional[str] = typer.Option(None, "--resets", "-r", help="Weekly reset time e.g. 'Tue 9:00 AM'"),
+):
+    """Generate an optimal schedule to maximize remaining sessions before reset."""
+    conn = _db()
+    cfg = _load_config()
+    now = _now_utc()
+    plan = cfg.get("plan", "max_5x")
+    plan_ceiling = PLAN_WEEKLY_SESSIONS.get(plan, 50)
+
+    # Step 1 — sessions remaining
+    latest_sync = _latest_sync(conn)
+    sync_fresh = _sync_is_fresh(latest_sync)
+
+    if sessions is not None:
+        sessions_remaining = sessions
+    elif sync_fresh and latest_sync["weekly_pct_used"] is not None:
+        sessions_remaining = round((1 - latest_sync["weekly_pct_used"] / 100) * plan_ceiling)
+    else:
+        sessions_remaining = plan_ceiling - len(_sessions_this_week(conn))
+
+    sessions_remaining = max(0, min(sessions_remaining, plan_ceiling))
+
+    # Step 2 — weekly reset datetime
+    if resets is not None:
+        reset_datetime = _parse_weekly_reset(resets, now)
+        if reset_datetime is None:
+            console.print("[red]Could not parse --resets. Use format like 'Tue 9:00 AM'.[/red]")
+            raise typer.Exit(1)
+    elif sync_fresh and latest_sync["weekly_resets_at"]:
+        reset_datetime = _parse_weekly_reset(latest_sync["weekly_resets_at"], now)
+        if reset_datetime is None:
+            reset_datetime = now + timedelta(days=7)
+    else:
+        week_sessions = _sessions_this_week(conn)
+        if week_sessions:
+            oldest = datetime.fromisoformat(week_sessions[0]["started_at"])
+            reset_datetime = oldest + timedelta(days=7)
+        else:
+            reset_datetime = now + timedelta(days=7)
+
+    # Step 3 — time available
+    time_until_reset = reset_datetime - now
+    if time_until_reset.total_seconds() <= 0:
+        console.print(Panel(
+            "Weekly limit already reset — run [bold]claude-burnrate sync[/bold] to update.",
+            title="Optimize", border_style="dim"
+        ))
+        return
+
+    # Step 4 — feasibility check
+    hours_until_reset = time_until_reset.total_seconds() / 3600
+    max_possible = floor(hours_until_reset / SESSION_HOURS)
+
+    if sessions_remaining == 0:
+        console.print(Panel(
+            "No sessions remaining this week. Weekly budget likely exhausted.",
+            title="Optimize", border_style="dim"
+        ))
+        return
+
+    if sessions_remaining > max_possible:
+        console.print(
+            f"[yellow]Only {hours_until_reset:.0f}h until reset — you can fit at most "
+            f"{max_possible} more full sessions. Showing schedule for {max_possible}.[/yellow]\n"
+        )
+        sessions_remaining = max_possible
+
+    if sessions_remaining <= 0:
+        console.print(Panel(
+            f"Only {hours_until_reset:.1f}h until reset — not enough time for a full {SESSION_HOURS}h session.",
+            title="Optimize", border_style="dim"
+        ))
+        return
+
+    # Step 5 — generate optimal schedule
+    active = _active_session(conn)
+    if active:
+        started = datetime.fromisoformat(active["started_at"])
+        current_start = started + timedelta(hours=SESSION_HOURS)
+        if current_start < now:
+            current_start = now
+    else:
+        current_start = now
+
+    schedule = []
+    for _ in range(sessions_remaining):
+        candidate = current_start
+
+        # Avoid peak hours — push to after peak if needed
+        pt_time = _to_pt(candidate)
+        if pt_time.weekday() < 5 and PEAK_START_PT <= pt_time.hour < PEAK_END_PT:
+            # Push to 11am PT (end of peak)
+            pt_target = pt_time.replace(hour=PEAK_END_PT, minute=0, second=0, microsecond=0)
+            if pt_target <= pt_time:
+                pt_target += timedelta(days=1)
+            candidate = pt_target + timedelta(hours=7)  # PT to UTC
+
+        slot_end = candidate + timedelta(hours=SESSION_HOURS)
+
+        if slot_end > reset_datetime:
+            break
+
+        # Rate based on peak overlap
+        overlap = _peak_overlap_hours(candidate, slot_end)
+        rating = "IDEAL" if overlap == 0 else "OK"
+
+        schedule.append({
+            "start": candidate,
+            "end": slot_end,
+            "rating": rating,
+        })
+        current_start = slot_end
+
+    # Step 6 — carryover warning
+    if len(schedule) < sessions_remaining:
+        carried = sessions_remaining - len(schedule)
+        console.print(
+            f"[yellow]Only {len(schedule)} sessions fit before your reset — "
+            f"{carried} sessions will carry into next week.[/yellow]\n"
+        )
+
+    # Build output
+    reset_display = _to_display_tz(reset_datetime, cfg)
+    days_left = time_until_reset.days
+    hours_left = int((time_until_reset.total_seconds() % 86400) / 3600)
+    reset_str = f"{reset_display.strftime('%a %I:%M %p').lstrip('0')} {_tz_label(cfg)}"
+
+    summary = (
+        f"{sessions_remaining} sessions remaining | "
+        f"Resets {reset_str} (in {days_left}d {hours_left}h)"
+    )
+
+    # Table
+    table = Table(box=box.SIMPLE_HEAVY, show_lines=False)
+    table.add_column("#", style="bold", width=4)
+    table.add_column("Start time", width=24)
+    table.add_column("End time", width=24)
+    table.add_column("Window", justify="right", width=8)
+    table.add_column("Rating", width=10)
+
+    for i, slot in enumerate(schedule, 1):
+        start_disp = _to_display_tz(slot["start"], cfg)
+        end_disp = _to_display_tz(slot["end"], cfg)
+        color = "green" if slot["rating"] == "IDEAL" else "yellow"
+        icon = "+" if slot["rating"] == "IDEAL" else "~"
+        table.add_row(
+            str(i),
+            f"{start_disp.strftime('%a %I:%M %p').lstrip('0')} {_tz_label(cfg)}",
+            f"{end_disp.strftime('%a %I:%M %p').lstrip('0')} {_tz_label(cfg)}",
+            f"{SESSION_HOURS}.0h",
+            f"[{color}]{slot['rating']} {icon}[/{color}]",
+        )
+
+    # Bottom line
+    if schedule:
+        first_start = _to_display_tz(schedule[0]["start"], cfg)
+        first_time_str = f"{first_start.strftime('%a %I:%M %p').lstrip('0')} {_tz_label(cfg)}"
+        if schedule[0]["start"] <= now + timedelta(minutes=5):
+            bottom = (
+                f"Start session 1 now to use all "
+                f"{len(schedule)} sessions before your reset."
+            )
+        else:
+            bottom = (
+                f"Start session 1 at {first_time_str} to use all "
+                f"{len(schedule)} sessions before your reset."
+            )
+    else:
+        bottom = "No sessions can fit before reset."
+
+    console.print(Panel(f"{summary}\n", title="Optimize", border_style="cyan"))
+    console.print(table)
+    console.print(f"\n{bottom}")
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _parse_weekly_reset(text: str, now_utc: datetime) -> Optional[datetime]:
+    """Parse 'Tue 9:00 AM' → next occurrence of that weekday+time in UTC.
+
+    Assumes input is ET (UTC-4), converts to UTC.
+    """
+    day_map = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+    parts = text.strip().split(None, 1)
+    if len(parts) != 2:
+        return None
+    day_str = parts[0].lower().rstrip(",")
+    if day_str not in day_map:
+        return None
+    try:
+        t = datetime.strptime(parts[1].strip(), "%I:%M %p")
+    except ValueError:
+        return None
+
+    target_weekday = day_map[day_str]
+    current_weekday = now_utc.weekday()
+    days_ahead = (target_weekday - current_weekday) % 7
+    if days_ahead == 0:
+        # Same weekday — check if time already passed (in ET)
+        candidate = now_utc.replace(hour=t.hour, minute=t.minute, second=0, microsecond=0)
+        # Convert ET to UTC: add 4 hours
+        candidate_utc = candidate + timedelta(hours=4)
+        if candidate_utc <= now_utc:
+            days_ahead = 7
+    candidate_date = now_utc + timedelta(days=days_ahead)
+    result = candidate_date.replace(hour=t.hour, minute=t.minute, second=0, microsecond=0)
+    # Input is ET, convert to UTC by adding 4 hours
+    result_utc = result + timedelta(hours=4)
+    return result_utc
+
 
 def _make_bar(pct: int, width: int = 20) -> str:
     filled = int(width * pct / 100)
