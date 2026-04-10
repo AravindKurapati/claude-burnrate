@@ -68,10 +68,10 @@ claude-budget advice
 
 Output example:
 ```
-💡 Short sessions: You left ~3.2h unused across 2 sessions. Front-load heavier
+ Short sessions: You left ~3.2h unused across 2 sessions. Front-load heavier
    tasks so each 5h window is fully used.
 
-⚡ Peak hours: 4/7 sessions were during peak (5am-11am PT). Shifting heavy
+ Peak hours: 4/7 sessions were during peak (5am-11am PT). Shifting heavy
    sessions to evenings gives you the same window but it drains slower.
 ```
 
