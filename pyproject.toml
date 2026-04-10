@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "claude-burnrate"
-version = "0.1.0"
+version = "0.2.0"
 description = "Track your Claude session + weekly usage. Never waste limits again."
 readme = "Readme.md"
 requires-python = ">=3.9"
