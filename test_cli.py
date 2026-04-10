@@ -370,3 +370,137 @@ class TestPlanCommand:
         # At least one rating should appear
         has_rating = any(r in result.output for r in ["IDEAL", "OK", "AVOID"])
         assert has_rating
+
+
+# ── sync command tests ────────────────────────────────────────────────────
+
+def _insert_sync(conn, synced_at, session_pct=50, weekly_pct=30,
+                 session_expires_at=None, weekly_resets_at=None, source="manual"):
+    conn.execute(
+        "INSERT INTO sync_snapshots (synced_at, session_pct_used, weekly_pct_used, "
+        "session_expires_at, weekly_resets_at, source) VALUES (?,?,?,?,?,?)",
+        (synced_at.isoformat(), session_pct, weekly_pct,
+         session_expires_at.isoformat() if session_expires_at else None,
+         weekly_resets_at, source)
+    )
+    conn.commit()
+
+
+class TestSyncCommand:
+    def test_sync_manual_all_flags(self, tmp_path):
+        """All 4 flags provided, snapshot stored correctly."""
+        conn = _setup_test_db(tmp_path)
+        result = runner.invoke(cli_mod.app, [
+            "sync", "--session", "58", "--weekly", "40",
+            "--resets-in", "3h 47m", "--weekly-resets", "Tue 9:00 AM"
+        ])
+        assert result.exit_code == 0
+        assert "42% remaining" in result.output  # 100-58
+        assert "60% remaining" in result.output  # 100-40
+        row = conn.execute("SELECT * FROM sync_snapshots ORDER BY id DESC LIMIT 1").fetchone()
+        assert row["session_pct_used"] == 58
+        assert row["weekly_pct_used"] == 40
+        assert row["source"] == "manual"
+        assert row["session_expires_at"] is not None
+        assert row["weekly_resets_at"] == "Tue 9:00 AM"
+
+    def test_sync_manual_session_only(self, tmp_path):
+        """Only --session and --resets-in provided."""
+        conn = _setup_test_db(tmp_path)
+        result = runner.invoke(cli_mod.app, [
+            "sync", "--session", "25", "--resets-in", "2h"
+        ])
+        assert result.exit_code == 0
+        assert "75% remaining" in result.output
+        row = conn.execute("SELECT * FROM sync_snapshots ORDER BY id DESC LIMIT 1").fetchone()
+        assert row["session_pct_used"] == 25
+        assert row["weekly_pct_used"] is None
+        assert row["source"] == "manual"
+
+    def test_sync_manual_invalid_percentage(self, tmp_path):
+        """--session 150 shows error."""
+        _setup_test_db(tmp_path)
+        result = runner.invoke(cli_mod.app, ["sync", "--session", "150", "--resets-in", "1h"])
+        assert result.exit_code == 1
+        assert "0-100" in result.output
+
+    def test_sync_paste_valid_text(self, tmp_path):
+        """Paste text matching Claude's format, all fields parsed."""
+        conn = _setup_test_db(tmp_path)
+        paste = "Usage 58% used Resets in 3 hr 47 min 40% used Resets Tue 9:00 AM\n"
+        result = runner.invoke(cli_mod.app, ["sync"], input=paste)
+        assert result.exit_code == 0
+        assert "42% remaining" in result.output
+        row = conn.execute("SELECT * FROM sync_snapshots ORDER BY id DESC LIMIT 1").fetchone()
+        assert row["session_pct_used"] == 58
+        assert row["weekly_pct_used"] == 40
+        assert row["source"] == "paste"
+
+    def test_sync_paste_missing_field(self, tmp_path):
+        """Paste text without 'Resets in' shows warning."""
+        _setup_test_db(tmp_path)
+        paste = "Usage 58% used Some other text\n"
+        result = runner.invoke(cli_mod.app, ["sync"], input=paste)
+        assert result.exit_code == 0
+        assert "could not parse" in result.output.lower()
+
+    def test_sync_paste_partial(self, tmp_path):
+        """Only session found, weekly missing, stores what it can."""
+        conn = _setup_test_db(tmp_path)
+        paste = "Usage 58% used Resets in 2 hr 30 min\n"
+        result = runner.invoke(cli_mod.app, ["sync"], input=paste)
+        assert result.exit_code == 0
+        row = conn.execute("SELECT * FROM sync_snapshots ORDER BY id DESC LIMIT 1").fetchone()
+        assert row["session_pct_used"] == 58
+        assert row["weekly_pct_used"] is None
+
+    def test_sync_freshness(self, tmp_path):
+        """Snapshot older than 2h returns False from _sync_is_fresh."""
+        conn = _setup_test_db(tmp_path)
+        old_time = datetime.now(timezone.utc) - timedelta(hours=3)
+        _insert_sync(conn, synced_at=old_time)
+        snap = cli_mod._latest_sync(conn)
+        assert not cli_mod._sync_is_fresh(snap)
+
+        # Fresh one should be True
+        fresh_time = datetime.now(timezone.utc) - timedelta(minutes=30)
+        _insert_sync(conn, synced_at=fresh_time)
+        snap2 = cli_mod._latest_sync(conn)
+        assert cli_mod._sync_is_fresh(snap2)
+
+    def test_status_uses_sync_when_fresh(self, tmp_path):
+        """status shows synced % not elapsed bar when sync is fresh."""
+        conn = _setup_test_db(tmp_path)
+        now = datetime.now(timezone.utc)
+        # Active session
+        _insert_session(conn, started_at=now - timedelta(hours=2), ended_at=None, messages=0)
+        # Fresh sync
+        _insert_sync(conn, synced_at=now - timedelta(minutes=5), session_pct=45,
+                     weekly_pct=30, session_expires_at=now + timedelta(hours=3))
+        result = runner.invoke(cli_mod.app, ["status"])
+        assert result.exit_code == 0
+        assert "45%" in result.output
+        assert "synced" in result.output.lower()
+        assert "Live data" in result.output
+
+    def test_estimate_uses_sync_expires_at(self, tmp_path):
+        """estimate uses synced expiry time."""
+        conn = _setup_test_db(tmp_path)
+        now = datetime.now(timezone.utc)
+        _insert_session(conn, started_at=now - timedelta(hours=2), ended_at=None, messages=0)
+        _insert_sync(conn, synced_at=now - timedelta(minutes=5),
+                     session_expires_at=now + timedelta(hours=2))
+        result = runner.invoke(cli_mod.app, ["estimate"])
+        assert result.exit_code == 0
+        assert "last sync" in result.output.lower()
+
+    def test_plan_uses_sync_next_window(self, tmp_path):
+        """plan uses synced expiry as window start."""
+        conn = _setup_test_db(tmp_path)
+        now = datetime.now(timezone.utc)
+        _insert_session(conn, started_at=now - timedelta(hours=2), ended_at=None, messages=0)
+        _insert_sync(conn, synced_at=now - timedelta(minutes=5),
+                     session_expires_at=now + timedelta(hours=1))
+        result = runner.invoke(cli_mod.app, ["plan"])
+        assert result.exit_code == 0
+        assert "last sync" in result.output.lower()
