@@ -2,6 +2,7 @@
 claude-burnrate: Track your Claude session and weekly usage so you never waste limits again.
 """
 
+import re
 import typer
 import json
 import csv
@@ -82,6 +83,17 @@ def _db() -> sqlite3.Connection:
         CREATE TABLE IF NOT EXISTS config (
             key   TEXT PRIMARY KEY,
             value TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sync_snapshots (
+            id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+            synced_at          TEXT NOT NULL,
+            session_pct_used   INTEGER,
+            weekly_pct_used    INTEGER,
+            session_expires_at TEXT,
+            weekly_resets_at   TEXT,
+            source             TEXT DEFAULT 'manual'
         )
     """)
     # Migration: add project column if missing
@@ -165,6 +177,21 @@ def _session_duration_hrs(session: sqlite3.Row) -> float:
     end_str = session["ended_at"]
     end = datetime.fromisoformat(end_str) if end_str else _now_utc()
     return (end - start).total_seconds() / 3600
+
+
+def _latest_sync(conn: sqlite3.Connection) -> Optional[sqlite3.Row]:
+    """Return the most recent sync snapshot or None."""
+    return conn.execute(
+        "SELECT * FROM sync_snapshots ORDER BY synced_at DESC LIMIT 1"
+    ).fetchone()
+
+
+def _sync_is_fresh(snapshot: Optional[sqlite3.Row]) -> bool:
+    """True if snapshot exists and synced_at is within 2 hours of now."""
+    if snapshot is None:
+        return False
+    synced_at = datetime.fromisoformat(snapshot["synced_at"])
+    return (_now_utc() - synced_at).total_seconds() < 7200
 
 
 # ── Plan capacity estimates ───────────────────────────────────────────────────
@@ -321,6 +348,13 @@ def status(verbose: bool = typer.Option(False, "--verbose", "-v")):
     peak_sessions = sum(1 for s in sessions_week if s["peak_hour"])
     offpeak_sessions = total_sessions - peak_sessions
 
+    # ── Sync overlay ──────────────────────────────────────────────
+    latest_sync = _latest_sync(conn)
+    sync_fresh = _sync_is_fresh(latest_sync)
+    sync_ago_min = None
+    if sync_fresh:
+        sync_ago_min = int((_now_utc() - datetime.fromisoformat(latest_sync["synced_at"])).total_seconds() / 60)
+
     # ── Active session panel ─────────────────────────────────────
     if active:
         dur = _session_duration_hrs(active)
@@ -331,13 +365,27 @@ def status(verbose: bool = typer.Option(False, "--verbose", "-v")):
 
         started_utc = datetime.fromisoformat(active['started_at'])
         started_local = _to_display_tz(started_utc, cfg)
-        console.print(Panel(
-            f"[bold]{active['label']}[/bold]  [{active['task_type']}]{peak_flag}\n"
-            f"Started: {active['started_at'][:16]} UTC  ({started_local.strftime('%I:%M%p')} {_tz_label(cfg)})\n"
-            f"Elapsed: {_make_bar(pct_session, 25)} [cyan]{dur:.1f}h[/cyan] / {SESSION_HOURS}h\n"
-            f"Remaining: [green bold]{remaining:.1f}h[/green bold]",
-            title="🟢 Active Session", border_style="green"
-        ))
+
+        if sync_fresh:
+            session_pct = latest_sync["session_pct_used"]
+            expires_line = ""
+            if latest_sync["session_expires_at"]:
+                exp_dt = _to_display_tz(datetime.fromisoformat(latest_sync["session_expires_at"]), cfg)
+                expires_line = f"\nExpires at: {exp_dt.strftime('%I:%M%p').lstrip('0').lower()} {_tz_label(cfg)}"
+            console.print(Panel(
+                f"[bold]{active['label']}[/bold]  [{active['task_type']}]{peak_flag}\n"
+                f"Session: [cyan]{session_pct}%[/cyan] used (synced {sync_ago_min}m ago){expires_line}\n"
+                f"[dim]Live data from Settings > Usage[/dim]",
+                title="Active Session", border_style="green"
+            ))
+        else:
+            console.print(Panel(
+                f"[bold]{active['label']}[/bold]  [{active['task_type']}]{peak_flag}\n"
+                f"Started: {active['started_at'][:16]} UTC  ({started_local.strftime('%I:%M%p')} {_tz_label(cfg)})\n"
+                f"Elapsed: {_make_bar(pct_session, 25)} [cyan]{dur:.1f}h[/cyan] / {SESSION_HOURS}h\n"
+                f"Remaining: [green bold]{remaining:.1f}h[/green bold]",
+                title="Active Session", border_style="green"
+            ))
     else:
         pt_now = _to_pt(now)
         peak_now = _is_peak(now, cfg.get("timezone_offset", 0))
@@ -358,14 +406,23 @@ def status(verbose: bool = typer.Option(False, "--verbose", "-v")):
     if wasted_hrs > 0.1:
         waste_line = f"\n[red]Wasted:[/red] ~[bold]{wasted_hrs:.1f}h[/bold] across {len(wasted)} short sessions - time you paid for but didn't use"
 
-    console.print(Panel(
-        f"Plan: [bold]{PLAN_LABELS.get(plan, plan)}[/bold]\n"
-        f"Sessions (7d): {_make_bar(pct_used, 30)} [cyan]{total_sessions}[/cyan] / ~{plan_sessions} est.\n"
-        f"Messages (7d): [cyan]{total_msgs:,}[/cyan]  |  Tokens est: [cyan]{total_tokens:,}[/cyan]\n"
-        f"Peak: [red]{peak_sessions}[/red] sessions  |  Off-peak: [green]{offpeak_sessions}[/green] sessions"
-        + waste_line,
-        title="Weekly Budget", border_style="blue"
-    ))
+    if sync_fresh and latest_sync["weekly_pct_used"] is not None:
+        weekly_pct_synced = latest_sync["weekly_pct_used"]
+        weekly_lines = (
+            f"Plan: [bold]{PLAN_LABELS.get(plan, plan)}[/bold]\n"
+            f"Weekly: [cyan]{weekly_pct_synced}%[/cyan] used (synced {sync_ago_min}m ago)\n"
+            f"[dim]Live data from Settings > Usage[/dim]"
+        )
+        console.print(Panel(weekly_lines, title="Weekly Budget", border_style="blue"))
+    else:
+        console.print(Panel(
+            f"Plan: [bold]{PLAN_LABELS.get(plan, plan)}[/bold]\n"
+            f"Sessions (7d): {_make_bar(pct_used, 30)} [cyan]{total_sessions}[/cyan] / ~{plan_sessions} est.\n"
+            f"Messages (7d): [cyan]{total_msgs:,}[/cyan]  |  Tokens est: [cyan]{total_tokens:,}[/cyan]\n"
+            f"Peak: [red]{peak_sessions}[/red] sessions  |  Off-peak: [green]{offpeak_sessions}[/green] sessions"
+            + waste_line,
+            title="Weekly Budget", border_style="blue"
+        ))
 
     if verbose:
         _show_session_table(sessions_week)
@@ -603,8 +660,16 @@ def estimate(
     now = _now_utc()
 
     # Step 1 - time remaining
+    latest_sync = _latest_sync(conn)
+    sync_fresh = _sync_is_fresh(latest_sync)
+
     active = _active_session(conn)
-    if active:
+    if sync_fresh and latest_sync["session_expires_at"]:
+        session_expires = datetime.fromisoformat(latest_sync["session_expires_at"])
+        time_remaining = max(0, (session_expires - now).total_seconds() / 3600)
+        sync_ago = int((now - datetime.fromisoformat(latest_sync["synced_at"])).total_seconds() / 60)
+        time_line = f"Active session: [cyan]{time_remaining:.1f}h[/cyan] remaining\n[dim]Session time from last sync ({sync_ago}m ago)[/dim]"
+    elif active:
         elapsed = _session_duration_hrs(active)
         time_remaining = max(0, SESSION_HOURS - elapsed)
         time_line = f"Active session: [cyan]{time_remaining:.1f}h[/cyan] remaining"
@@ -684,8 +749,21 @@ def plan_cmd():
     now = _now_utc()
 
     # Step 1 — current session state
+    latest_sync = _latest_sync(conn)
+    sync_fresh = _sync_is_fresh(latest_sync)
+
     active = _active_session(conn)
-    if active:
+    if sync_fresh and latest_sync["session_expires_at"]:
+        next_window_start = datetime.fromisoformat(latest_sync["session_expires_at"])
+        remaining = max(0, (next_window_start - now).total_seconds() / 3600)
+        display_expires = _to_display_tz(next_window_start, cfg)
+        sync_ago = int((now - datetime.fromisoformat(latest_sync["synced_at"])).total_seconds() / 60)
+        state_line = (
+            f"Active session: [cyan]{remaining:.1f}h[/cyan] remaining, "
+            f"expires at [bold]{display_expires.strftime('%I:%M%p').lstrip('0').lower()}[/bold] ({_tz_label(cfg)})\n"
+            f"[dim]Window timing from last sync ({sync_ago}m ago)[/dim]"
+        )
+    elif active:
         started = datetime.fromisoformat(active["started_at"])
         next_window_start = started + timedelta(hours=SESSION_HOURS)
         remaining = max(0, (next_window_start - now).total_seconds() / 3600)
@@ -696,7 +774,7 @@ def plan_cmd():
         )
     else:
         next_window_start = now
-        state_line = "No active session — next window available now"
+        state_line = "No active session -- next window available now"
 
     # Step 2 — generate 4 candidate windows
     windows = []
@@ -820,6 +898,139 @@ def _peak_overlap_hours(start_utc: datetime, end_utc: datetime) -> float:
         current = next_day_pt - timedelta(hours=-7)  # convert PT midnight back to UTC
 
     return total_overlap
+
+
+def _parse_resets_in(text: str) -> Optional[timedelta]:
+    """Parse duration strings like '3h 47m', '47m', '3h' into timedelta."""
+    m = re.match(r'^\s*(?:(\d+)\s*h)?\s*(?:(\d+)\s*m)?\s*$', text)
+    if not m or (m.group(1) is None and m.group(2) is None):
+        return None
+    hours = int(m.group(1)) if m.group(1) else 0
+    minutes = int(m.group(2)) if m.group(2) else 0
+    td = timedelta(hours=hours, minutes=minutes)
+    return td if td.total_seconds() > 0 else None
+
+
+def _store_sync(conn, session_pct: int, weekly_pct: Optional[int],
+                session_expires_at: Optional[datetime], weekly_resets_at: Optional[str],
+                source: str):
+    """Write a sync snapshot to the DB."""
+    conn.execute(
+        "INSERT INTO sync_snapshots (synced_at, session_pct_used, weekly_pct_used, "
+        "session_expires_at, weekly_resets_at, source) VALUES (?,?,?,?,?,?)",
+        (
+            _now_utc().isoformat(),
+            session_pct,
+            weekly_pct,
+            session_expires_at.isoformat() if session_expires_at else None,
+            weekly_resets_at,
+            source,
+        )
+    )
+    conn.commit()
+
+
+def _sync_confirmation_panel(session_pct: int, weekly_pct: Optional[int],
+                              session_expires_at: Optional[datetime],
+                              weekly_resets_at: Optional[str], source: str, cfg: dict):
+    """Print the sync confirmation panel."""
+    session_remaining = 100 - session_pct
+    lines = [f"[green bold]Synced from {'pasted text' if source == 'paste' else 'manual input'}[/green bold]"]
+    if session_expires_at:
+        display_exp = _to_display_tz(session_expires_at, cfg)
+        lines.append(f"Session: [cyan]{session_remaining}%[/cyan] remaining (expires at {display_exp.strftime('%I:%M%p').lstrip('0').lower()} {_tz_label(cfg)})")
+    else:
+        lines.append(f"Session: [cyan]{session_remaining}%[/cyan] remaining")
+    if weekly_pct is not None:
+        lines.append(f"Weekly:  [cyan]{100 - weekly_pct}%[/cyan] remaining")
+    if weekly_resets_at:
+        lines.append(f"Resets:  {weekly_resets_at} {_tz_label(cfg)}")
+    console.print(Panel("\n".join(lines), title="Sync", border_style="green"))
+
+
+@app.command("sync")
+def sync_cmd(
+    session: Optional[int] = typer.Option(None, "--session", "-s", help="Session percentage used (0-100)"),
+    weekly: Optional[int] = typer.Option(None, "--weekly", "-w", help="Weekly percentage used (0-100)"),
+    resets_in: Optional[str] = typer.Option(None, "--resets-in", "-r", help="Time until session resets e.g. '3h 47m'"),
+    weekly_resets: Optional[str] = typer.Option(None, "--weekly-resets", help="When weekly limit resets e.g. 'Tue 9:00 AM'"),
+):
+    """Sync burnrate with real numbers from Claude's Settings > Usage page."""
+    conn = _db()
+    cfg = _load_config()
+    now = _now_utc()
+
+    any_flags = session is not None or weekly is not None or resets_in is not None or weekly_resets is not None
+
+    if any_flags:
+        # ── Mode A: direct input ──────────────────────────────────
+        if session is not None and (session < 0 or session > 100):
+            console.print("[red]--session must be 0-100[/red]")
+            raise typer.Exit(1)
+        if weekly is not None and (weekly < 0 or weekly > 100):
+            console.print("[red]--weekly must be 0-100[/red]")
+            raise typer.Exit(1)
+
+        session_expires_at = None
+        if resets_in is not None:
+            td = _parse_resets_in(resets_in)
+            if td is None:
+                console.print("[red]Could not parse --resets-in. Use format like '3h 47m', '47m', or '3h'.[/red]")
+                raise typer.Exit(1)
+            session_expires_at = now + td
+
+        _store_sync(conn, session or 0, weekly, session_expires_at, weekly_resets, "manual")
+        _sync_confirmation_panel(session or 0, weekly, session_expires_at, weekly_resets, "manual", cfg)
+
+    else:
+        # ── Mode B: interactive paste ─────────────────────────────
+        console.print(Panel(
+            "Paste all text from the [bold]Settings > Usage[/bold] page as a single line when prompted, then press Enter.\n"
+            "Or use flags instead: [bold]claude-burnrate sync --session X --weekly Y --resets-in '3h 47m'[/bold]",
+            title="Sync from Claude", border_style="cyan"
+        ))
+
+        text = typer.prompt("Paste text")
+        if not text.strip():
+            console.print("[yellow]No text pasted. Aborting.[/yellow]")
+            raise typer.Exit(0)
+
+        # Parse session percentage
+        session_matches = re.findall(r'(\d+)%\s*used', text)
+        session_pct = int(session_matches[0]) if session_matches else None
+
+        # Parse resets in
+        resets_match = re.search(r'Resets in\s+(?:(\d+)\s*hr?\s*)?(?:(\d+)\s*min)?', text)
+        parsed_td = None
+        if resets_match and (resets_match.group(1) or resets_match.group(2)):
+            hrs = int(resets_match.group(1)) if resets_match.group(1) else 0
+            mins = int(resets_match.group(2)) if resets_match.group(2) else 0
+            parsed_td = timedelta(hours=hrs, minutes=mins)
+
+        # Parse weekly percentage (second occurrence)
+        weekly_pct = int(session_matches[1]) if len(session_matches) > 1 else None
+
+        # Parse weekly reset day
+        weekly_resets_text = None
+        weekly_resets_match = re.search(
+            r'Resets\s+(Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+(\d+:\d+\s*[AP]M)', text
+        )
+        if weekly_resets_match:
+            weekly_resets_text = f"{weekly_resets_match.group(1)} {weekly_resets_match.group(2)}"
+
+        # Validate required fields
+        if session_pct is None:
+            console.print("[yellow]Could not parse session percentage from pasted text.[/yellow]")
+            console.print("Try manual input: [bold]claude-burnrate sync --session X --weekly Y --resets-in '3h 47m'[/bold]")
+            raise typer.Exit(0)
+        if parsed_td is None:
+            console.print("[yellow]Could not parse 'Resets in' from pasted text.[/yellow]")
+            console.print("Try manual input: [bold]claude-burnrate sync --session X --weekly Y --resets-in '3h 47m'[/bold]")
+            raise typer.Exit(0)
+
+        session_expires_at = now + parsed_td
+        _store_sync(conn, session_pct, weekly_pct, session_expires_at, weekly_resets_text, "paste")
+        _sync_confirmation_panel(session_pct, weekly_pct, session_expires_at, weekly_resets_text, "paste", cfg)
 
 
 @app.command("config")
