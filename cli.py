@@ -35,9 +35,22 @@ PEAK_END_PT   = 11         # 11am PT
 
 DEFAULT_CONFIG = {
     "plan": "max_5x",      # pro | max_5x | max_20x
-    "timezone_offset": 0,  # hours offset from PT (e.g. ET = +3, GMT = +8)
+    "timezone_offset": -4,  # hours offset from UTC (ET=-4, PT=-7, GMT=0)
     "weekly_reset_day": None,  # ISO weekday 1=Mon..7=Sun, None = auto-detect
     "weekly_reset_time": None, # ISO string of first session start this week
+}
+
+TZ_SHORTCUTS = {
+    "et": -4, "edt": -4,
+    "est": -5,
+    "ct": -5, "cdt": -5,
+    "cst": -6,
+    "mt": -6, "mdt": -6,
+    "mst": -7,
+    "pt": -7, "pdt": -7,
+    "pst": -8,
+    "gmt": 0, "utc": 0,
+    "ist": 6,
 }
 
 PLAN_LABELS = {
@@ -99,14 +112,30 @@ def _now_utc() -> datetime:
 
 
 def _to_pt(dt: datetime, tz_offset: int = 0) -> datetime:
-    """Convert UTC datetime to PT (UTC-7 in summer, UTC-8 in winter). tz_offset adjusts for user's local."""
+    """Convert UTC datetime to PT (UTC-7 in summer, UTC-8 in winter)."""
     pt_offset = -7  # PDT approximation
     return dt + timedelta(hours=pt_offset)
 
 
+def _to_display_tz(dt: datetime, cfg: dict) -> datetime:
+    """Convert UTC datetime to user's display timezone."""
+    offset = cfg.get("timezone_offset", -4)
+    return dt + timedelta(hours=offset)
+
+
+def _tz_label(cfg: dict) -> str:
+    """Return a label like 'UTC-4' for display."""
+    offset = cfg.get("timezone_offset", -4)
+    if offset >= 0:
+        return f"UTC+{offset}"
+    return f"UTC{offset}"
+
+
 def _is_peak(dt_utc: datetime, tz_offset: int = 0) -> bool:
-    """True if dt_utc falls in Anthropic peak hours (5am-11am PT)."""
+    """True if dt_utc falls in Anthropic peak hours (5am-11am PT on weekdays)."""
     pt = _to_pt(dt_utc, tz_offset)
+    if pt.weekday() >= 5:  # Saturday=5, Sunday=6
+        return False
     return PEAK_START_PT <= pt.hour < PEAK_END_PT
 
 
@@ -644,10 +673,156 @@ def estimate(
     console.print(f"\n{caveat}")
 
 
+@app.command("plan")
+def plan_cmd():
+    """Plan your next session to avoid wasting budget on peak hours."""
+    conn = _db()
+    cfg = _load_config()
+    now = _now_utc()
+
+    # Step 1 — current session state
+    active = _active_session(conn)
+    if active:
+        started = datetime.fromisoformat(active["started_at"])
+        next_window_start = started + timedelta(hours=SESSION_HOURS)
+        remaining = max(0, (next_window_start - now).total_seconds() / 3600)
+        display_expires = _to_display_tz(next_window_start, cfg)
+        state_line = (
+            f"Active session: [cyan]{remaining:.1f}h[/cyan] remaining, "
+            f"expires at [bold]{display_expires.strftime('%I:%M%p').lstrip('0').lower()}[/bold] ({_tz_label(cfg)})"
+        )
+    else:
+        next_window_start = now
+        state_line = "No active session — next window available now"
+
+    # Step 2 — generate 4 candidate windows
+    windows = []
+    for i in range(4):
+        w_start = next_window_start + timedelta(hours=5 * i)
+        w_end = w_start + timedelta(hours=SESSION_HOURS)
+        overlap = _peak_overlap_hours(w_start, w_end)
+        effective = 5.0 - (overlap * 0.25)
+
+        if overlap == 0:
+            rating, color, icon = "IDEAL", "green", "✓"
+        elif overlap <= 2:
+            rating, color, icon = "OK", "yellow", "~"
+        else:
+            rating, color, icon = "AVOID", "red", "✗"
+
+        display_dt = _to_display_tz(w_start, cfg)
+        windows.append({
+            "start_utc": w_start,
+            "display_dt": display_dt,
+            "overlap": overlap,
+            "effective": effective,
+            "rating": rating,
+            "color": color,
+            "icon": icon,
+        })
+
+    # Step 3 — build table
+    table = Table(box=box.SIMPLE_HEAVY, show_lines=False)
+    table.add_column("Window", style="bold", width=8)
+    table.add_column("Local Time", width=22)
+    table.add_column("Effective hrs", justify="right", width=14)
+    table.add_column("Rating", width=10)
+
+    labels = ["Next", "+5h", "+10h", "+15h"]
+    for label, w in zip(labels, windows):
+        dt = w["display_dt"]
+        # Format: "Mon 10:00pm (UTC-4)"
+        time_str = f"{dt.strftime('%a %I:%M%p').lstrip('0')} ({_tz_label(cfg)})"
+        table.add_row(
+            label,
+            time_str,
+            f"{w['effective']:.1f}h",
+            f"[{w['color']}]{w['rating']} {w['icon']}[/{w['color']}]",
+        )
+
+    # Step 4 — find best window
+    best = None
+    for w in windows:
+        if w["rating"] == "IDEAL":
+            best = w
+            break
+    if best is None:
+        for w in windows:
+            if w["rating"] == "OK":
+                best = w
+                break
+    if best is None:
+        best = windows[0]
+
+    # Step 5 — recommendation
+    if not active and windows[0]["rating"] == "IDEAL":
+        rec_line = "[green]Start now[/green] — you're off-peak, full 5h window available."
+    elif not active and windows[0]["rating"] == "AVOID":
+        time_to_best = (best["start_utc"] - now).total_seconds() / 3600
+        hrs = int(time_to_best)
+        mins = int((time_to_best - hrs) * 60)
+        lost = 5.0 - windows[0]["effective"]
+        rec_line = (
+            f"[yellow]Wait[/yellow] — starting now costs you ~{lost:.1f}h of effective time. "
+            f"Next IDEAL window in {hrs}h {mins}m."
+        )
+    else:
+        best_dt = best["display_dt"]
+        best_time = best_dt.strftime('%a %I:%M%p').lstrip('0').lower()
+        rec_line = (
+            f"[green]Recommendation:[/green] Start your next session at {best_time} "
+            f"— full {best['effective']:.1f}h effective window, no peak hour drain."
+        )
+
+    # Step 6 — weekly budget
+    plan = cfg.get("plan", "max_5x")
+    plan_ceiling = PLAN_WEEKLY_SESSIONS.get(plan, 50)
+    sessions_left = max(0, plan_ceiling - len(_sessions_this_week(conn)))
+    budget_line = f"Weekly budget: [cyan]{sessions_left}[/cyan] sessions remaining (estimated)"
+
+    # Assemble panel
+    console.print(Panel(
+        f"{state_line}\n",
+        title="Session Planner", border_style="cyan"
+    ))
+    console.print(table)
+    console.print(f"\n{rec_line}\n")
+    console.print(f"[dim]{budget_line}[/dim]")
+
+
+def _peak_overlap_hours(start_utc: datetime, end_utc: datetime) -> float:
+    """Calculate how many hours of [start_utc, end_utc] overlap with peak hours (5am-11am PT, weekdays only)."""
+    total_overlap = 0.0
+    # Iterate day by day over the window
+    current = start_utc
+    while current < end_utc:
+        pt = _to_pt(current)
+        # Only weekdays
+        if pt.weekday() < 5:
+            # Peak window for this day in PT
+            day_start_pt = pt.replace(hour=PEAK_START_PT, minute=0, second=0, microsecond=0)
+            day_end_pt = pt.replace(hour=PEAK_END_PT, minute=0, second=0, microsecond=0)
+            # Convert back to UTC for comparison
+            pt_offset = -7
+            day_start_utc = day_start_pt - timedelta(hours=pt_offset)
+            day_end_utc = day_end_pt - timedelta(hours=pt_offset)
+            # Overlap with our window
+            overlap_start = max(start_utc, day_start_utc)
+            overlap_end = min(end_utc, day_end_utc)
+            if overlap_end > overlap_start:
+                total_overlap += (overlap_end - overlap_start).total_seconds() / 3600
+
+        # Move to next day
+        next_day_pt = _to_pt(current).replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+        current = next_day_pt - timedelta(hours=-7)  # convert PT midnight back to UTC
+
+    return total_overlap
+
+
 @app.command("config")
 def config_cmd(
     plan: Optional[str] = typer.Option(None, "--plan", "-p", help="pro | max_5x | max_20x"),
-    tz_offset: Optional[int] = typer.Option(None, "--tz", help="Hours ahead of PT (ET=3, GMT=8, IST=13.5->14)"),
+    tz: Optional[str] = typer.Option(None, "--tz", help="UTC offset in hours (ET=-4, CT=-5, PT=-7, GMT=0) or name (et, pt, gmt, ist)"),
     show: bool = typer.Option(False, "--show", "-s", help="Show current config"),
 ):
     """View or update your plan config."""
@@ -660,17 +835,28 @@ def config_cmd(
         cfg["plan"] = plan
         console.print(f"[green]Plan set to: {PLAN_LABELS[plan]}[/green]")
 
-    if tz_offset is not None:
-        cfg["timezone_offset"] = tz_offset
-        console.print(f"[green]Timezone offset set to: +{tz_offset}h from PT[/green]")
+    if tz is not None:
+        tz_lower = tz.strip().lower()
+        if tz_lower in TZ_SHORTCUTS:
+            offset = TZ_SHORTCUTS[tz_lower]
+        else:
+            try:
+                offset = int(tz)
+            except ValueError:
+                valid = ", ".join(sorted(TZ_SHORTCUTS.keys()))
+                console.print(f"[red]Unknown timezone '{tz}'. Use a named shortcut ({valid}) or an integer UTC offset (e.g. -4).[/red]")
+                raise typer.Exit(1)
+        cfg["timezone_offset"] = offset
+        console.print(f"[green]Timezone set to: {_tz_label(cfg)}[/green]")
 
-    if plan or tz_offset is not None:
+    if plan or tz is not None:
         _save_config(cfg)
 
-    if show or (not plan and tz_offset is None):
+    if show or (not plan and tz is None):
+        label = _tz_label(cfg)
         console.print(Panel(
             f"Plan:            [cyan]{PLAN_LABELS.get(cfg['plan'], cfg['plan'])}[/cyan]\n"
-            f"TZ offset (PT+): [cyan]{cfg.get('timezone_offset', 0)}h[/cyan]\n"
+            f"Timezone:        [cyan]{label}[/cyan]  (change with: claude-burnrate config --tz -5)\n"
             f"DB path:         [dim]{DB_PATH}[/dim]\n"
             f"Config path:     [dim]{CONFIG_PATH}[/dim]",
             title="⚙ Config", border_style="dim"
