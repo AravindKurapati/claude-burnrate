@@ -238,8 +238,9 @@ def start_session(
     pct = min(100, int(used / plan_sessions * 100))
     budget_bar = _make_bar(pct, 30)
 
+    display_time = _to_display_tz(now, cfg)
     console.print(Panel(
-        f"[green bold]✓ Session started[/green bold]  [dim]{now.strftime('%Y-%m-%d %H:%M')} UTC[/dim]\n"
+        f"[green bold]✓ Session started[/green bold]  [dim]{now.strftime('%Y-%m-%d %H:%M')} UTC  ({display_time.strftime('%I:%M%p')} {_tz_label(cfg)})[/dim]\n"
         f"Label: [cyan]{label or 'unlabeled'}[/cyan]  |  Task: [cyan]{task or 'general'}[/cyan]\n"
         f"Window: [bold]{SESSION_HOURS}h[/bold] rolling{peak_warning}\n\n"
         f"Weekly sessions used: {budget_bar}  {used}/{plan_sessions} est. ({pct}%)",
@@ -328,9 +329,11 @@ def status(verbose: bool = typer.Option(False, "--verbose", "-v")):
         peak_now = _is_peak(now, cfg.get("timezone_offset", 0))
         peak_flag = " [red bold]⚡ PEAK[/red bold]" if peak_now else " [green]✓ off-peak[/green]"
 
+        started_utc = datetime.fromisoformat(active['started_at'])
+        started_local = _to_display_tz(started_utc, cfg)
         console.print(Panel(
             f"[bold]{active['label']}[/bold]  [{active['task_type']}]{peak_flag}\n"
-            f"Started: {active['started_at'][:16]} UTC\n"
+            f"Started: {active['started_at'][:16]} UTC  ({started_local.strftime('%I:%M%p')} {_tz_label(cfg)})\n"
             f"Elapsed: {_make_bar(pct_session, 25)} [cyan]{dur:.1f}h[/cyan] / {SESSION_HOURS}h\n"
             f"Remaining: [green bold]{remaining:.1f}h[/green bold]",
             title="🟢 Active Session", border_style="green"
@@ -464,7 +467,7 @@ def advice():
 
     console.print(Panel(
         "\n\n".join(tips),
-        title="💡 Usage Advice", border_style="cyan", padding=(1, 2)
+        title=" Usage Advice", border_style="cyan", padding=(1, 2)
     ))
 
 
