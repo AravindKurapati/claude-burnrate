@@ -285,3 +285,88 @@ class TestProjectTagging:
         row = conn2.execute("PRAGMA table_info(sessions)").fetchall()
         col_names = [r["name"] for r in row]
         assert "project" in col_names
+
+
+# ── config timezone tests ──────────────────────────────────────────────────
+
+class TestConfigTimezone:
+    def test_config_tz_named_shortcut_et(self, tmp_path):
+        """config --tz et sets timezone_offset to -4."""
+        _setup_test_db(tmp_path)
+        result = runner.invoke(cli_mod.app, ["config", "--tz", "et"])
+        assert result.exit_code == 0
+        cfg = json.loads(cli_mod.CONFIG_PATH.read_text())
+        assert cfg["timezone_offset"] == -4
+
+    def test_config_tz_named_shortcut_pt(self, tmp_path):
+        """config --tz pt sets timezone_offset to -7."""
+        _setup_test_db(tmp_path)
+        result = runner.invoke(cli_mod.app, ["config", "--tz", "pt"])
+        assert result.exit_code == 0
+        cfg = json.loads(cli_mod.CONFIG_PATH.read_text())
+        assert cfg["timezone_offset"] == -7
+
+    def test_config_tz_raw_offset(self, tmp_path):
+        """config --tz -5 sets timezone_offset to -5."""
+        _setup_test_db(tmp_path)
+        result = runner.invoke(cli_mod.app, ["config", "--tz", "-5"])
+        assert result.exit_code == 0
+        cfg = json.loads(cli_mod.CONFIG_PATH.read_text())
+        assert cfg["timezone_offset"] == -5
+
+    def test_config_tz_invalid(self, tmp_path):
+        """config --tz xyz prints error."""
+        _setup_test_db(tmp_path)
+        result = runner.invoke(cli_mod.app, ["config", "--tz", "xyz"])
+        assert result.exit_code == 1
+        assert "unknown timezone" in result.output.lower()
+
+    def test_display_tz_conversion(self, tmp_path):
+        """_to_display_tz converts UTC to configured offset."""
+        dt_utc = datetime(2025, 6, 15, 18, 0, 0, tzinfo=timezone.utc)
+        cfg = {"timezone_offset": -4}
+        result = cli_mod._to_display_tz(dt_utc, cfg)
+        assert result.hour == 14  # 18 - 4 = 14
+        assert result.day == 15
+
+
+# ── plan command tests ─────────────────────────────────────────────────────
+
+class TestPlanCommand:
+    def test_plan_no_active_session(self, tmp_path):
+        """plan with no active session shows 'available now' and 4 windows."""
+        _setup_test_db(tmp_path)
+        result = runner.invoke(cli_mod.app, ["plan"])
+        assert result.exit_code == 0
+        assert "no active session" in result.output.lower()
+        assert "Next" in result.output
+        assert "+5h" in result.output
+        assert "+10h" in result.output
+        assert "+15h" in result.output
+
+    def test_plan_with_active_session(self, tmp_path):
+        """plan with active session shows remaining time."""
+        conn = _setup_test_db(tmp_path)
+        now = datetime.now(timezone.utc)
+        _insert_session(conn, started_at=now - timedelta(hours=2), ended_at=None, messages=0)
+        result = runner.invoke(cli_mod.app, ["plan"])
+        assert result.exit_code == 0
+        assert "active session" in result.output.lower()
+        assert "remaining" in result.output.lower()
+
+    def test_plan_shows_weekly_budget(self, tmp_path):
+        """plan shows weekly budget line."""
+        _setup_test_db(tmp_path)
+        result = runner.invoke(cli_mod.app, ["plan"])
+        assert result.exit_code == 0
+        assert "weekly budget" in result.output.lower()
+        assert "sessions remaining" in result.output.lower()
+
+    def test_plan_shows_ratings(self, tmp_path):
+        """plan shows IDEAL/OK/AVOID ratings."""
+        _setup_test_db(tmp_path)
+        result = runner.invoke(cli_mod.app, ["plan"])
+        assert result.exit_code == 0
+        # At least one rating should appear
+        has_rating = any(r in result.output for r in ["IDEAL", "OK", "AVOID"])
+        assert has_rating
