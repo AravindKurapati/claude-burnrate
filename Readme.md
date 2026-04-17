@@ -1,4 +1,4 @@
-# claude-budget $$
+# claude-budget
 
 > **Stop losing 10-15% of your weekly Claude limit to wasted sessions.**
 
@@ -9,9 +9,10 @@ A lightweight CLI that tracks your Claude 5-hour session windows and 7-day weekl
 ## The problem this solves
 
 Claude's usage model has two layers:
-- **5-hour rolling sessions** - starts when you send your first message, expires 5 hours later whether you use them or not
-- **7-day weekly cap** - total usage across all surfaces (claude.ai, Claude Code, Desktop)
-- **Peak hours** - since March 2026, sessions drain *faster* during 5am–11am PT on weekdays
+
+- **5-hour rolling sessions** - starts when you send your first message, expires 5 hours later whether you use it or not
+- **7-day weekly cap** - total usage across all surfaces: claude.ai, Claude Code, and Desktop
+- **Peak hours** - since March 2026, sessions drain faster during 5am-11am PT on weekdays
 
 If you're careful all week but start sessions you don't finish, or accidentally run heavy work during peak hours, you lose budget you already paid for. This tool surfaces that waste and helps you avoid it.
 
@@ -24,63 +25,74 @@ pip install claude-budget
 ```
 
 Or from source:
+
 ```bash
 git clone https://github.com/AravindKurapati/claude-budget
 cd claude-budget
 pip install -e .
 ```
 
-**Requirements:** Python 3.9+ - no API keys needed, everything is local.
+**Requirements:** Python 3.9+. No API keys needed; everything is local.
 
 ---
 
 ## Usage
 
-### Start a session (run before opening Claude)
+### Start a session
+
+Run this before opening Claude:
+
 ```bash
 claude-budget start --label "RAG pipeline" --task coding
 ```
 
 Output:
-```
-🟢 Session Started  2026-04-09 09:00 UTC
+
+```text
+Session Started  2026-04-09 09:00 UTC
 Label: RAG pipeline  |  Task: coding
 Window: 5h rolling
-✓ off-peak - good time for heavy work
+OK off-peak - good time for heavy work
 
-Weekly sessions used: ██░░░░░░░░░░░░░░░░░░░░░░░░░░░░  3/50 est. (6%)
+Weekly sessions used: ##............................  3/50 est. (6%)
 ```
 
 ### Check status mid-session
+
 ```bash
 claude-budget status
 ```
 
 ### End a session and log usage
+
 ```bash
 claude-budget end --messages 45 --tokens 30000
 ```
 
 ### Get personalised waste-reduction advice
+
 ```bash
 claude-budget advice
 ```
 
 Output example:
-```
- Short sessions: You left ~3.2h unused across 2 sessions. Front-load heavier
-   tasks so each 5h window is fully used.
 
- Peak hours: 4/7 sessions were during peak (5am-11am PT). Shifting heavy
-   sessions to evenings gives you the same window but it drains slower.
+```text
+Short sessions: You left ~3.2h unused across 2 sessions. Front-load heavier
+tasks so each 5h window is fully used.
+
+Peak hours: 4/7 sessions were during peak (5am-11am PT). Shifting heavy
+sessions to evenings gives you the same window but it drains slower.
 ```
 
 ### View history
+
 ```bash
 claude-budget history --days 7
 ```
 
 ### Configure your plan
+
 ```bash
 claude-budget config --plan max_5x --tz 3   # ET = PT+3
 claude-budget config --plan pro              # or max_20x
@@ -94,11 +106,14 @@ claude-budget config --show
 | Command | What it does |
 |---------|-------------|
 | `start` | Begin tracking a new session (`--project` to tag) |
-| `end` | Close session, log messages + token estimate |
-| `status` | Current session + weekly budget at a glance |
+| `end` | Close session, log messages and token estimate |
+| `status` | Current session and weekly budget at a glance |
 | `history` | Session log for last N days (`--project` to filter) |
 | `dashboard` | Visual terminal charts for recent usage (`--project` to filter) |
 | `projects` | Summarize sessions, messages, and tokens by project |
+| `doctor` | Check config, stale sessions, sync freshness, and data quality |
+| `forecast` | Estimate when current pace reaches 80% and 100% of weekly budget |
+| `review` | Retrospective summary for recent sessions |
 | `week` | Project end-of-week budget based on burn pace |
 | `estimate` | Estimate questions remaining by size and model |
 | `plan` | Pick better start times around active windows and peak hours |
@@ -124,12 +139,24 @@ claude-budget projects
 
 ---
 
+## Forecast and review
+
+```bash
+claude-budget doctor
+claude-budget forecast
+claude-budget review --days 14
+```
+
+`doctor` flags setup and data-quality problems, such as stale sync data or missing message counts. `forecast` estimates when your current pace will hit 80% and 100% of your weekly budget. `review` gives a compact retrospective of recent sessions, including short-session waste, peak-hour usage, message pace, and the main project.
+
+---
+
 ## Peak hours
 
 Since March 26, 2026, Anthropic burns through your 5-hour session limit faster during weekday peak hours:
 
-- **Peak:** Mon–Fri, 5am–11am PT (1pm–7pm GMT)
-- **Off-peak:** Evenings, nights, weekends - same window lasts longer
+- **Peak:** Mon-Fri, 5am-11am PT (1pm-7pm GMT)
+- **Off-peak:** Evenings, nights, weekends. Same window, slower drain.
 
 `claude-budget status` always shows whether you're in peak hours right now, so you can time your heavy sessions accordingly.
 
@@ -137,9 +164,9 @@ Since March 26, 2026, Anthropic burns through your 5-hour session limit faster d
 
 ## How usage is stored
 
-Everything is local - a SQLite database at `~/.claude_budget/usage.db`. No data leaves your machine. Config lives at `~/.claude_budget/config.json`.
+Everything is local: a SQLite database at `~/.claude_budget/usage.db`. No data leaves your machine. Config lives at `~/.claude_budget/config.json`.
 
-Token estimates are manual (you enter them when ending a session) because Anthropic doesn't expose token counts through the claude.ai interface. Even rough estimates are enough to see patterns over time.
+Token estimates are manual because Anthropic doesn't expose token counts through the claude.ai interface. Even rough estimates are enough to see patterns over time.
 
 ---
 
@@ -154,7 +181,6 @@ From the `advice` command, and from building this tool:
 5. **Use sub-agents for research** - Claude Code sub-agents do research without bloating your main context window.
 
 ---
-
 
 PRs welcome. If you've found other patterns that reduce waste, open an issue.
 

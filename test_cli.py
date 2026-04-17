@@ -353,6 +353,57 @@ class TestProjectsCommand:
         assert "3,000" in result.output
 
 
+class TestDoctorForecastReviewCommands:
+    def test_doctor_reports_setup(self, tmp_path):
+        _setup_test_db(tmp_path)
+        result = runner.invoke(cli_mod.app, ["doctor"])
+        assert result.exit_code == 0
+        assert "doctor" in result.output.lower()
+        assert "plan configured" in result.output.lower()
+        assert "no sessions tracked" in result.output.lower()
+
+    def test_forecast_no_sessions(self, tmp_path):
+        _setup_test_db(tmp_path)
+        result = runner.invoke(cli_mod.app, ["forecast"])
+        assert result.exit_code == 0
+        assert "not enough pace data" in result.output.lower()
+
+    def test_forecast_with_sessions(self, tmp_path):
+        conn = _setup_test_db(tmp_path)
+        now = datetime.now(timezone.utc)
+        for i in range(3):
+            start = now - timedelta(days=3 - i)
+            _insert_session(conn, started_at=start, ended_at=start + timedelta(hours=4))
+
+        result = runner.invoke(cli_mod.app, ["forecast"])
+        assert result.exit_code == 0
+        assert "current pace" in result.output.lower()
+        assert "80%" in result.output
+        assert "100%" in result.output
+        assert "projected by reset" in result.output.lower()
+
+    def test_review_no_sessions(self, tmp_path):
+        _setup_test_db(tmp_path)
+        result = runner.invoke(cli_mod.app, ["review"])
+        assert result.exit_code == 0
+        assert "no sessions found" in result.output.lower()
+
+    def test_review_summarizes_patterns(self, tmp_path):
+        conn = _setup_test_db(tmp_path)
+        now = datetime.now(timezone.utc)
+        _insert_session(conn, started_at=now - timedelta(hours=10), ended_at=now - timedelta(hours=6),
+                        messages=20, tokens_est=1000, peak_hour=1, project="alpha")
+        _insert_session(conn, started_at=now - timedelta(hours=5), ended_at=now - timedelta(hours=3),
+                        messages=10, tokens_est=700, peak_hour=0, project="alpha")
+
+        result = runner.invoke(cli_mod.app, ["review"])
+        assert result.exit_code == 0
+        assert "sessions" in result.output.lower()
+        assert "messages" in result.output.lower()
+        assert "main project" in result.output.lower()
+        assert "alpha" in result.output
+
+
 class TestConfigTimezone:
     def test_config_tz_named_shortcut_et(self, tmp_path):
         """config --tz et sets timezone_offset to -4."""

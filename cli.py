@@ -648,6 +648,214 @@ def projects(
     console.print(table)
 
 
+@app.command("doctor")
+def doctor():
+    """Check tracking setup and flag usage data issues."""
+    conn = _db()
+    cfg = _load_config()
+    now = _now_utc()
+    sessions_week = _sessions_this_week(conn)
+    active = _active_session(conn)
+    latest_sync = _latest_sync(conn)
+    completed = [s for s in sessions_week if s["ended_at"]]
+    short = [s for s in completed if _session_duration_hrs(s) < (SESSION_HOURS - 1.0)]
+    with_messages = [s for s in completed if (s["messages"] or 0) > 0]
+    peak_sessions = sum(1 for s in sessions_week if s["peak_hour"])
+
+    checks = []
+
+    plan = cfg.get("plan")
+    if plan in PLAN_WEEKLY_SESSIONS:
+        checks.append(("[green]OK[/green]", f"Plan configured: {PLAN_LABELS.get(plan, plan)}"))
+    else:
+        checks.append(("[red]Fix[/red]", "Unknown plan in config. Run [bold]claude-budget config --plan max_5x[/bold]."))
+
+    tz_offset = cfg.get("timezone_offset")
+    if isinstance(tz_offset, int):
+        checks.append(("[green]OK[/green]", f"Display timezone configured: {_tz_label(cfg)}"))
+    else:
+        checks.append(("[yellow]Check[/yellow]", "Timezone is missing or invalid. Run [bold]claude-budget config --tz et[/bold]."))
+
+    if active:
+        duration = _session_duration_hrs(active)
+        if duration > SESSION_HOURS + 0.25:
+            checks.append(("[yellow]Check[/yellow]", f"Active session has been open for {duration:.1f}h. Run [bold]claude-budget end[/bold] if it is stale."))
+        else:
+            checks.append(("[green]OK[/green]", f"Active session is {duration:.1f}h into the {SESSION_HOURS}h window."))
+    else:
+        checks.append(("[dim]Info[/dim]", "No active session right now."))
+
+    if latest_sync:
+        synced_at = datetime.fromisoformat(latest_sync["synced_at"])
+        sync_age = (now - synced_at).total_seconds() / 3600
+        if _sync_is_fresh(latest_sync):
+            checks.append(("[green]OK[/green]", f"Usage sync is fresh ({sync_age * 60:.0f}m old)."))
+        else:
+            checks.append(("[yellow]Check[/yellow]", f"Usage sync is stale ({sync_age:.1f}h old). Run [bold]claude-budget sync[/bold] for live percentages."))
+    else:
+        checks.append(("[dim]Info[/dim]", "No synced usage snapshot yet. Run [bold]claude-budget sync[/bold] when you want live percentages."))
+
+    if not sessions_week:
+        checks.append(("[yellow]Check[/yellow]", "No sessions tracked in the last 7 days. Start one before your next Claude window."))
+    else:
+        checks.append(("[green]OK[/green]", f"{len(sessions_week)} session(s) tracked in the last 7 days."))
+
+    if completed and not with_messages:
+        checks.append(("[yellow]Check[/yellow]", "Completed sessions have no message counts. Add [bold]--messages[/bold] when ending sessions for better estimates."))
+    elif with_messages:
+        checks.append(("[green]OK[/green]", f"{len(with_messages)} completed session(s) include message counts."))
+
+    if completed:
+        short_pct = len(short) / len(completed)
+        if short_pct >= 0.4:
+            checks.append(("[yellow]Check[/yellow]", f"{len(short)}/{len(completed)} completed sessions ended early. Review batching or timing."))
+        else:
+            checks.append(("[green]OK[/green]", "Short-session waste is under control."))
+
+    if sessions_week:
+        peak_pct = peak_sessions / len(sessions_week)
+        if peak_pct >= 0.5:
+            checks.append(("[yellow]Check[/yellow]", f"{peak_sessions}/{len(sessions_week)} sessions started during peak hours. Shift heavy work later when possible."))
+        else:
+            checks.append(("[green]OK[/green]", "Most sessions are off-peak."))
+
+    table = Table(box=box.SIMPLE_HEAVY, show_lines=False)
+    table.add_column("Status", width=10)
+    table.add_column("Check", min_width=50)
+    for status, message in checks:
+        table.add_row(status, message)
+
+    console.print(Panel(
+        f"DB: [dim]{DB_PATH}[/dim]\nConfig: [dim]{CONFIG_PATH}[/dim]",
+        title="Doctor", border_style="cyan"
+    ))
+    console.print(table)
+
+
+@app.command("forecast")
+def forecast(
+    days: int = typer.Option(7, "--days", "-d", help="How many days of history to use"),
+):
+    """Forecast when current pace hits weekly budget thresholds."""
+    conn = _db()
+    cfg = _load_config()
+    now = _now_utc()
+    cutoff = (now - timedelta(days=days)).isoformat()
+    sessions = conn.execute(
+        "SELECT * FROM sessions WHERE started_at > ? ORDER BY started_at ASC", (cutoff,)
+    ).fetchall()
+
+    if not sessions:
+        console.print(Panel(
+            f"No sessions in the last {days} days, so there is not enough pace data yet.",
+            title="Forecast", border_style="dim"
+        ))
+        return
+
+    oldest = datetime.fromisoformat(sessions[0]["started_at"])
+    elapsed_days = max((now - oldest).total_seconds() / 86400, 0.1)
+    sessions_per_day = len(sessions) / elapsed_days
+    plan = cfg.get("plan", "max_5x")
+    plan_ceiling = PLAN_WEEKLY_SESSIONS.get(plan, 50)
+    reset_at = oldest + timedelta(days=7)
+
+    table = Table(box=box.SIMPLE_HEAVY, show_lines=False)
+    table.add_column("Threshold", width=12)
+    table.add_column("Sessions", justify="right", width=10)
+    table.add_column("Forecast", min_width=32)
+
+    for label, pct in [("80%", 0.8), ("100%", 1.0)]:
+        target = max(1, int(plan_ceiling * pct))
+        if len(sessions) >= target:
+            forecast_line = "[yellow]Already reached[/yellow]"
+        elif sessions_per_day <= 0:
+            forecast_line = "[dim]No burn rate yet[/dim]"
+        else:
+            days_until = (target - len(sessions)) / sessions_per_day
+            hit_at = now + timedelta(days=days_until)
+            hit_display = _to_display_tz(hit_at, cfg)
+            if hit_at > reset_at:
+                forecast_line = f"After reset at current pace"
+            else:
+                forecast_line = f"{hit_display.strftime('%a %I:%M %p').lstrip('0')} {_tz_label(cfg)}"
+        table.add_row(label, f"{target}/{plan_ceiling}", forecast_line)
+
+    reset_display = _to_display_tz(reset_at, cfg)
+    projected_total = len(sessions) + sessions_per_day * max(0, (reset_at - now).total_seconds() / 86400)
+    console.print(Panel(
+        f"[bold]Plan:[/bold] {PLAN_LABELS.get(plan, plan)}\n"
+        f"[bold]Current pace:[/bold] [cyan]{sessions_per_day:.1f}[/cyan] sessions/day over {elapsed_days:.1f} tracked day(s)\n"
+        f"[bold]Used:[/bold] [cyan]{len(sessions)}[/cyan] / {plan_ceiling} estimated sessions\n"
+        f"[bold]Projected by reset:[/bold] [cyan]{projected_total:.0f}[/cyan] / {plan_ceiling}\n"
+        f"[bold]Reset estimate:[/bold] {reset_display.strftime('%a %I:%M %p').lstrip('0')} {_tz_label(cfg)}",
+        title="Forecast", border_style="blue"
+    ))
+    console.print(table)
+
+
+@app.command("review")
+def review(
+    days: int = typer.Option(7, "--days", "-d", help="How many days back to review"),
+):
+    """Review recent usage patterns and next actions."""
+    conn = _db()
+    cutoff = (_now_utc() - timedelta(days=days)).isoformat()
+    sessions = conn.execute(
+        "SELECT * FROM sessions WHERE started_at > ? ORDER BY started_at DESC", (cutoff,)
+    ).fetchall()
+
+    if not sessions:
+        console.print(Panel(
+            f"No sessions found in the last {days} days.",
+            title="Review", border_style="dim"
+        ))
+        return
+
+    completed = [s for s in sessions if s["ended_at"]]
+    short = [s for s in completed if _session_duration_hrs(s) < (SESSION_HOURS - 1.0)]
+    wasted_hrs = sum(SESSION_HOURS - _session_duration_hrs(s) for s in short)
+    peak = sum(1 for s in sessions if s["peak_hour"])
+    total_messages = sum(s["messages"] or 0 for s in sessions)
+    total_tokens = sum(s["tokens_est"] or 0 for s in sessions)
+    total_duration = sum(_session_duration_hrs(s) for s in completed)
+    msg_rate = total_messages / total_duration if total_duration > 0 else 0
+
+    projects_seen = {}
+    for s in sessions:
+        name = s["project"] or "(unprojected)"
+        projects_seen[name] = projects_seen.get(name, 0) + 1
+    top_project = max(projects_seen.items(), key=lambda kv: kv[1])[0]
+
+    notes = []
+    if short:
+        notes.append(f"[yellow]Short sessions:[/yellow] {len(short)} session(s) left about {wasted_hrs:.1f}h unused.")
+    else:
+        notes.append("[green]Session length:[/green] Completed sessions are using the window well.")
+
+    if peak > len(sessions) * 0.4:
+        notes.append(f"[yellow]Peak timing:[/yellow] {peak}/{len(sessions)} sessions started during peak hours.")
+    else:
+        notes.append("[green]Peak timing:[/green] Most sessions started off-peak.")
+
+    if msg_rate > 0:
+        notes.append(f"[cyan]Message pace:[/cyan] {msg_rate:.1f} messages/hour across completed sessions.")
+    else:
+        notes.append("[dim]Message pace:[/dim] Add message counts when ending sessions to unlock better estimates.")
+
+    notes.append(f"[cyan]Main project:[/cyan] {top_project} ({projects_seen[top_project]} session(s)).")
+
+    console.print(Panel(
+        f"[bold]Window:[/bold] last {days} days\n"
+        f"[bold]Sessions:[/bold] [cyan]{len(sessions)}[/cyan]  |  "
+        f"[bold]Completed:[/bold] [cyan]{len(completed)}[/cyan]  |  "
+        f"[bold]Active:[/bold] [cyan]{len(sessions) - len(completed)}[/cyan]\n"
+        f"[bold]Messages:[/bold] [cyan]{total_messages:,}[/cyan]  |  "
+        f"[bold]Tokens est:[/bold] [cyan]{total_tokens:,}[/cyan]\n\n"
+        + "\n".join(notes),
+        title="Review", border_style="cyan", padding=(1, 2)
+    ))
+
+
 @app.command("advice")
 def advice():
     """Get personalised tips to stop wasting your weekly limit."""
