@@ -468,6 +468,186 @@ def history(
         )
 
 
+@app.command("dashboard")
+def dashboard(
+    days: int = typer.Option(7, "--days", "-d", help="How many days back to chart"),
+    project: str = typer.Option("", "--project", "-p", help="Filter by project name"),
+):
+    """Show visual usage charts for recent sessions."""
+    conn = _db()
+    cfg = _load_config()
+    cutoff = (_now_utc() - timedelta(days=days)).isoformat()
+
+    if project:
+        sessions = conn.execute(
+            "SELECT * FROM sessions WHERE started_at > ? AND project = ? ORDER BY started_at ASC",
+            (cutoff, project)
+        ).fetchall()
+    else:
+        sessions = conn.execute(
+            "SELECT * FROM sessions WHERE started_at > ? ORDER BY started_at ASC",
+            (cutoff,)
+        ).fetchall()
+
+    title_suffix = f" - {project}" if project else ""
+    if not sessions:
+        console.print(Panel(
+            f"No sessions found in the last {days} days{title_suffix}.",
+            title="Usage Dashboard", border_style="dim"
+        ))
+        return
+
+    daily = {}
+    for s in sessions:
+        started = _to_display_tz(datetime.fromisoformat(s["started_at"]), cfg)
+        day_key = started.strftime("%Y-%m-%d")
+        if day_key not in daily:
+            daily[day_key] = {"sessions": 0, "messages": 0, "tokens": 0}
+        daily[day_key]["sessions"] += 1
+        daily[day_key]["messages"] += s["messages"] or 0
+        daily[day_key]["tokens"] += s["tokens_est"] or 0
+
+    total_sessions = len(sessions)
+    total_messages = sum(s["messages"] or 0 for s in sessions)
+    total_tokens = sum(s["tokens_est"] or 0 for s in sessions)
+    completed = [s for s in sessions if s["ended_at"]]
+    active = [s for s in sessions if not s["ended_at"]]
+    short = [s for s in completed if _session_duration_hrs(s) < (SESSION_HOURS - 1.0)]
+    used_well = len(completed) - len(short)
+    peak = sum(1 for s in sessions if s["peak_hour"])
+    offpeak = total_sessions - peak
+    avg_duration = (
+        sum(_session_duration_hrs(s) for s in completed) / len(completed)
+        if completed else 0
+    )
+
+    summary = (
+        f"[bold]Window:[/bold] last {days} days{title_suffix}\n"
+        f"[bold]Sessions:[/bold] [cyan]{total_sessions}[/cyan]  |  "
+        f"[bold]Messages:[/bold] [cyan]{total_messages:,}[/cyan]  |  "
+        f"[bold]Tokens est:[/bold] [cyan]{total_tokens:,}[/cyan]\n"
+        f"[bold]Avg completed duration:[/bold] [cyan]{avg_duration:.1f}h[/cyan]"
+    )
+    console.print(Panel(summary, title="Usage Dashboard", border_style="cyan"))
+
+    max_sessions = max(v["sessions"] for v in daily.values())
+    max_messages = max(v["messages"] for v in daily.values())
+    daily_table = Table(title="Daily Usage", box=box.SIMPLE_HEAVY, show_lines=False)
+    daily_table.add_column("Day", width=12)
+    daily_table.add_column("Sessions", justify="right", width=8)
+    daily_table.add_column("Session chart", min_width=18)
+    daily_table.add_column("Messages", justify="right", width=9)
+    daily_table.add_column("Message chart", min_width=18)
+    daily_table.add_column("Tokens", justify="right", width=10)
+
+    for day_key in sorted(daily):
+        values = daily[day_key]
+        day_label = datetime.fromisoformat(day_key).strftime("%a %m/%d")
+        daily_table.add_row(
+            day_label,
+            str(values["sessions"]),
+            _make_count_bar(values["sessions"], max_sessions),
+            f"{values['messages']:,}",
+            _make_count_bar(values["messages"], max_messages),
+            f"{values['tokens']:,}",
+        )
+    console.print(daily_table)
+
+    split_table = Table(title="Patterns", box=box.SIMPLE_HEAVY, show_lines=False)
+    split_table.add_column("Metric", width=18)
+    split_table.add_column("Count", justify="right", width=8)
+    split_table.add_column("Chart", min_width=22)
+    split_max = max(peak, offpeak, used_well, len(short), len(active), 1)
+    split_table.add_row("Peak", str(peak), _make_count_bar(peak, split_max, style="red"))
+    split_table.add_row("Off-peak", str(offpeak), _make_count_bar(offpeak, split_max, style="green"))
+    split_table.add_row("Used well", str(used_well), _make_count_bar(used_well, split_max, style="green"))
+    split_table.add_row("Ended early", str(len(short)), _make_count_bar(len(short), split_max, style="yellow"))
+    split_table.add_row("Active", str(len(active)), _make_count_bar(len(active), split_max, style="cyan"))
+    console.print(split_table)
+
+
+@app.command("projects")
+def projects(
+    days: int = typer.Option(30, "--days", "-d", help="How many days back to summarize"),
+):
+    """Summarize usage by project tag."""
+    conn = _db()
+    cutoff = (_now_utc() - timedelta(days=days)).isoformat()
+    sessions = conn.execute(
+        "SELECT * FROM sessions WHERE started_at > ? ORDER BY started_at DESC", (cutoff,)
+    ).fetchall()
+
+    if not sessions:
+        console.print(Panel(
+            f"No sessions found in the last {days} days.",
+            title="Projects", border_style="dim"
+        ))
+        return
+
+    grouped = {}
+    for s in sessions:
+        name = s["project"] or "(unprojected)"
+        if name not in grouped:
+            grouped[name] = {
+                "sessions": 0,
+                "messages": 0,
+                "tokens": 0,
+                "duration": 0.0,
+                "completed": 0,
+                "short": 0,
+                "peak": 0,
+                "last_seen": s["started_at"],
+            }
+
+        item = grouped[name]
+        item["sessions"] += 1
+        item["messages"] += s["messages"] or 0
+        item["tokens"] += s["tokens_est"] or 0
+        item["peak"] += 1 if s["peak_hour"] else 0
+        if s["started_at"] > item["last_seen"]:
+            item["last_seen"] = s["started_at"]
+        if s["ended_at"]:
+            duration = _session_duration_hrs(s)
+            item["duration"] += duration
+            item["completed"] += 1
+            if duration < (SESSION_HOURS - 1.0):
+                item["short"] += 1
+
+    project_names = ", ".join(sorted(grouped.keys()))
+    console.print(Panel(
+        f"[bold]Window:[/bold] last {days} days\n"
+        f"[bold]Projects:[/bold] [cyan]{len(grouped)}[/cyan]  |  "
+        f"[bold]Sessions:[/bold] [cyan]{len(sessions)}[/cyan]\n"
+        f"[bold]Tracked:[/bold] {project_names}",
+        title="Projects", border_style="cyan"
+    ))
+
+    table = Table(box=box.SIMPLE_HEAVY, show_lines=False)
+    table.add_column("Project", style="cyan", max_width=24)
+    table.add_column("Sessions", justify="right", width=8)
+    table.add_column("Messages", justify="right", width=9)
+    table.add_column("Tokens", justify="right", width=10)
+    table.add_column("Avg dur", justify="right", width=8)
+    table.add_column("Short", justify="right", width=6)
+    table.add_column("Peak", justify="right", width=6)
+    table.add_column("Last seen", width=16)
+
+    for name, item in sorted(grouped.items(), key=lambda kv: (-kv[1]["sessions"], kv[0].lower())):
+        avg_duration = item["duration"] / item["completed"] if item["completed"] else 0
+        table.add_row(
+            name,
+            str(item["sessions"]),
+            f"{item['messages']:,}",
+            f"{item['tokens']:,}",
+            f"{avg_duration:.1f}h" if item["completed"] else "-",
+            str(item["short"]),
+            str(item["peak"]),
+            item["last_seen"][:16],
+        )
+
+    console.print(table)
+
+
 @app.command("advice")
 def advice():
     """Get personalised tips to stop wasting your weekly limit."""
@@ -1307,6 +1487,14 @@ def _make_bar(pct: int, width: int = 20) -> str:
     empty = width - filled
     color = "green" if pct < 60 else "yellow" if pct < 85 else "red"
     return f"[{color}]{'█' * filled}[/{color}][dim]{'░' * empty}[/dim]"
+
+
+def _make_count_bar(value: int, max_value: int, width: int = 18, style: str = "cyan") -> str:
+    if max_value <= 0 or value <= 0:
+        return "[dim]" + "." * width + "[/dim]"
+    filled = max(1, int(width * value / max_value))
+    empty = max(0, width - filled)
+    return f"[{style}]{'#' * filled}[/{style}][dim]{'.' * empty}[/dim]"
 
 
 def _show_session_table(sessions: list, title: str = "Sessions"):

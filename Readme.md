@@ -97,12 +97,30 @@ claude-budget config --show
 | `end` | Close session, log messages + token estimate |
 | `status` | Current session + weekly budget at a glance |
 | `history` | Session log for last N days (`--project` to filter) |
+| `dashboard` | Visual terminal charts for recent usage (`--project` to filter) |
+| `projects` | Summarize sessions, messages, and tokens by project |
 | `week` | Project end-of-week budget based on burn pace |
 | `estimate` | Estimate questions remaining by size and model |
+| `plan` | Pick better start times around active windows and peak hours |
+| `sync` | Sync manual usage numbers from Claude's Settings > Usage page |
+| `optimize` | Schedule remaining sessions before weekly reset |
 | `export` | Export session history to CSV |
 | `advice` | Personalised tips based on your usage patterns |
 | `config` | Set plan and timezone |
 | `reset` | Wipe history (keeps config) |
+
+---
+
+## Visual summaries
+
+```bash
+claude-budget dashboard
+claude-budget dashboard --days 14
+claude-budget dashboard --project burnrate-build
+claude-budget projects
+```
+
+`dashboard` charts sessions, messages, peak/off-peak usage, short sessions, and active windows right in the terminal. `projects` rolls up usage by project tag so multi-session builds are easier to review.
 
 ---
 

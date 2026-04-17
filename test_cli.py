@@ -289,6 +289,70 @@ class TestProjectTagging:
 
 # ── config timezone tests ──────────────────────────────────────────────────
 
+class TestDashboardCommand:
+    def test_dashboard_no_sessions(self, tmp_path):
+        _setup_test_db(tmp_path)
+        result = runner.invoke(cli_mod.app, ["dashboard"])
+        assert result.exit_code == 0
+        assert "no sessions found" in result.output.lower()
+
+    def test_dashboard_shows_daily_charts(self, tmp_path):
+        conn = _setup_test_db(tmp_path)
+        now = datetime.now(timezone.utc)
+        _insert_session(conn, started_at=now - timedelta(days=2), ended_at=now - timedelta(days=2) + timedelta(hours=4),
+                        messages=20, tokens_est=1000, peak_hour=1)
+        _insert_session(conn, started_at=now - timedelta(days=1), ended_at=now - timedelta(days=1) + timedelta(hours=4),
+                        messages=30, tokens_est=2000, peak_hour=0)
+
+        result = runner.invoke(cli_mod.app, ["dashboard", "--days", "7"])
+        assert result.exit_code == 0
+        assert "usage dashboard" in result.output.lower()
+        assert "daily usage" in result.output.lower()
+        assert "patterns" in result.output.lower()
+        assert "Peak" in result.output
+        assert "Off-peak" in result.output
+        assert "#" in result.output
+
+    def test_dashboard_project_filter(self, tmp_path):
+        conn = _setup_test_db(tmp_path)
+        now = datetime.now(timezone.utc)
+        _insert_session(conn, started_at=now - timedelta(hours=6), ended_at=now - timedelta(hours=2),
+                        messages=12, tokens_est=700, project="alpha")
+        _insert_session(conn, started_at=now - timedelta(hours=5), ended_at=now - timedelta(hours=1),
+                        messages=99, tokens_est=9000, project="beta")
+
+        result = runner.invoke(cli_mod.app, ["dashboard", "--project", "alpha"])
+        assert result.exit_code == 0
+        assert "alpha" in result.output
+        assert "12" in result.output
+        assert "99" not in result.output
+
+
+class TestProjectsCommand:
+    def test_projects_no_sessions(self, tmp_path):
+        _setup_test_db(tmp_path)
+        result = runner.invoke(cli_mod.app, ["projects"])
+        assert result.exit_code == 0
+        assert "no sessions found" in result.output.lower()
+
+    def test_projects_groups_usage(self, tmp_path):
+        conn = _setup_test_db(tmp_path)
+        now = datetime.now(timezone.utc)
+        _insert_session(conn, started_at=now - timedelta(hours=10), ended_at=now - timedelta(hours=6),
+                        messages=10, tokens_est=1000, peak_hour=1, project="alpha")
+        _insert_session(conn, started_at=now - timedelta(hours=5), ended_at=now - timedelta(hours=3),
+                        messages=15, tokens_est=2000, peak_hour=0, project="alpha")
+        _insert_session(conn, started_at=now - timedelta(hours=4), ended_at=now - timedelta(hours=1),
+                        messages=7, tokens_est=500, peak_hour=0, project=None)
+
+        result = runner.invoke(cli_mod.app, ["projects", "--days", "30"])
+        assert result.exit_code == 0
+        assert "alpha" in result.output
+        assert "(unprojected)" in result.output
+        assert "25" in result.output
+        assert "3,000" in result.output
+
+
 class TestConfigTimezone:
     def test_config_tz_named_shortcut_et(self, tmp_path):
         """config --tz et sets timezone_offset to -4."""
