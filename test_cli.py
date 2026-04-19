@@ -404,6 +404,59 @@ class TestDoctorForecastReviewCommands:
         assert "alpha" in result.output
 
 
+class TestAssumptionsAndSimulation:
+    def test_assumptions_show_defaults(self, tmp_path):
+        _setup_test_db(tmp_path)
+        result = runner.invoke(cli_mod.app, ["assumptions"])
+        assert result.exit_code == 0
+        assert "session_hours" in result.output
+        assert "weekly_sessions.pro" in result.output
+
+    def test_assumptions_set_scalar(self, tmp_path):
+        _setup_test_db(tmp_path)
+        result = runner.invoke(cli_mod.app, ["assumptions", "--set", "peak_penalty=0.6"])
+        assert result.exit_code == 0
+        cfg = json.loads(cli_mod.CONFIG_PATH.read_text())
+        assert cfg["assumptions"]["peak_penalty"] == 0.6
+
+    def test_assumptions_set_weekly_sessions(self, tmp_path):
+        _setup_test_db(tmp_path)
+        result = runner.invoke(cli_mod.app, ["assumptions", "--set", "weekly_sessions.pro=12"])
+        assert result.exit_code == 0
+        cfg = json.loads(cli_mod.CONFIG_PATH.read_text())
+        assert cfg["assumptions"]["weekly_sessions"]["pro"] == 12
+
+    def test_assumptions_load_file(self, tmp_path):
+        _setup_test_db(tmp_path)
+        profile = tmp_path / "profile.json"
+        profile.write_text(json.dumps({"assumptions": {"default_msg_rate": 22}}))
+        result = runner.invoke(cli_mod.app, ["assumptions", "--load", str(profile)])
+        assert result.exit_code == 0
+        cfg = json.loads(cli_mod.CONFIG_PATH.read_text())
+        assert cfg["assumptions"]["default_msg_rate"] == 22
+
+    def test_assumptions_affect_estimate_default_rate(self, tmp_path):
+        _setup_test_db(tmp_path)
+        runner.invoke(cli_mod.app, ["assumptions", "--set", "default_msg_rate=20"])
+        result = runner.invoke(cli_mod.app, ["estimate"])
+        assert result.exit_code == 0
+        assert "20" in result.output
+
+    def test_simulate_outputs_thresholds(self, tmp_path):
+        _setup_test_db(tmp_path)
+        result = runner.invoke(cli_mod.app, ["simulate", "--sessions-per-day", "3", "--plan", "pro"])
+        assert result.exit_code == 0
+        assert "simulation" in result.output.lower()
+        assert "80%" in result.output
+        assert "100%" in result.output
+
+    def test_simulate_rejects_unknown_plan(self, tmp_path):
+        _setup_test_db(tmp_path)
+        result = runner.invoke(cli_mod.app, ["simulate", "--plan", "enterprise"])
+        assert result.exit_code == 1
+        assert "unknown plan" in result.output.lower()
+
+
 class TestConfigTimezone:
     def test_config_tz_named_shortcut_et(self, tmp_path):
         """config --tz et sets timezone_offset to -4."""

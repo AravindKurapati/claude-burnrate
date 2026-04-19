@@ -113,6 +113,8 @@ claude-budget config --show
 | `projects` | Summarize sessions, messages, and tokens by project |
 | `doctor` | Check config, stale sessions, sync freshness, and data quality |
 | `forecast` | Estimate when current pace reaches 80% and 100% of weekly budget |
+| `simulate` | Test hypothetical usage pace against a plan |
+| `assumptions` | View or tune local forecasting assumptions |
 | `review` | Retrospective summary for recent sessions |
 | `week` | Project end-of-week budget based on burn pace |
 | `estimate` | Estimate questions remaining by size and model |
@@ -144,10 +146,50 @@ claude-budget projects
 ```bash
 claude-budget doctor
 claude-budget forecast
+claude-budget simulate --sessions-per-day 3 --plan pro
 claude-budget review --days 14
 ```
 
-`doctor` flags setup and data-quality problems, such as stale sync data or missing message counts. `forecast` estimates when your current pace will hit 80% and 100% of your weekly budget. `review` gives a compact retrospective of recent sessions, including short-session waste, peak-hour usage, message pace, and the main project.
+`doctor` flags setup and data-quality problems, such as stale sync data or missing message counts. `forecast` estimates when your current pace will hit your warning threshold and 100% of your weekly budget. `simulate` models a hypothetical pace without changing your history. `review` gives a compact retrospective of recent sessions, including short-session waste, peak-hour usage, message pace, and the main project.
+
+---
+
+## Configurable assumptions
+
+Forecasts and estimates are local and configurable. Hiring managers, reviewers, or power users can tune the model without editing code:
+
+```bash
+claude-budget assumptions
+claude-budget assumptions --set peak_penalty=0.65
+claude-budget assumptions --set default_msg_rate=18
+claude-budget assumptions --set weekly_sessions.pro=12
+claude-budget assumptions --load examples/heavy_coder_assumptions.json
+claude-budget assumptions --reset
+```
+
+The configurable assumptions are stored in `~/.claude_budget/config.json`:
+
+```json
+{
+  "assumptions": {
+    "session_hours": 5,
+    "peak_penalty": 0.75,
+    "default_msg_rate": 10,
+    "short_session_threshold_hours": 4,
+    "fresh_sync_hours": 2,
+    "weekly_warning_threshold": 0.8,
+    "weekly_sessions": {
+      "pro": 10,
+      "max_5x": 50,
+      "max_20x": 200
+    }
+  }
+}
+```
+
+These values feed `estimate`, `forecast`, `simulate`, `doctor`, `review`, `dashboard`, `projects`, `plan`, `optimize`, `week`, `status`, and `advice`.
+
+Example assumption profiles live in `examples/` so reviewers can quickly test Pro, heavy-coding, and weekend-builder usage patterns.
 
 ---
 

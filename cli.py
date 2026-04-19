@@ -39,6 +39,7 @@ DEFAULT_CONFIG = {
     "timezone_offset": -4,  # hours offset from UTC (ET=-4, PT=-7, GMT=0)
     "weekly_reset_day": None,  # ISO weekday 1=Mon..7=Sun, None = auto-detect
     "weekly_reset_time": None, # ISO string of first session start this week
+    "assumptions": {},
 }
 
 TZ_SHORTCUTS = {
@@ -119,6 +120,54 @@ def _save_config(cfg: dict):
         json.dump(cfg, f, indent=2)
 
 
+def _load_assumptions(cfg: Optional[dict] = None) -> dict:
+    """Return validated modeling assumptions merged with defaults."""
+    cfg = cfg or _load_config()
+    raw = cfg.get("assumptions") or {}
+    assumptions = {
+        **DEFAULT_ASSUMPTIONS,
+        "weekly_sessions": DEFAULT_ASSUMPTIONS["weekly_sessions"].copy(),
+    }
+
+    for key in ASSUMPTION_FIELDS:
+        if key in raw:
+            assumptions[key] = raw[key]
+
+    if isinstance(raw.get("weekly_sessions"), dict):
+        weekly_sessions = assumptions["weekly_sessions"].copy()
+        for plan, value in raw["weekly_sessions"].items():
+            if plan in PLAN_WEEKLY_SESSIONS:
+                try:
+                    weekly_sessions[plan] = max(1, int(value))
+                except (TypeError, ValueError):
+                    pass
+        assumptions["weekly_sessions"] = weekly_sessions
+
+    assumptions["session_hours"] = max(0.1, float(assumptions["session_hours"]))
+    assumptions["peak_penalty"] = min(1.0, max(0.0, float(assumptions["peak_penalty"])))
+    assumptions["default_msg_rate"] = max(0.1, float(assumptions["default_msg_rate"]))
+    assumptions["short_session_threshold_hours"] = max(0.0, float(assumptions["short_session_threshold_hours"]))
+    assumptions["fresh_sync_hours"] = max(0.0, float(assumptions["fresh_sync_hours"]))
+    assumptions["weekly_warning_threshold"] = min(1.0, max(0.0, float(assumptions["weekly_warning_threshold"])))
+    return assumptions
+
+
+def _save_assumptions(assumptions: dict):
+    cfg = _load_config()
+    cfg["assumptions"] = assumptions
+    _save_config(cfg)
+
+
+def _plan_weekly_sessions(plan: str, assumptions: Optional[dict] = None) -> int:
+    assumptions = assumptions or _load_assumptions()
+    return assumptions["weekly_sessions"].get(plan, PLAN_WEEKLY_SESSIONS.get(plan, 50))
+
+
+def _short_session_threshold(assumptions: Optional[dict] = None) -> float:
+    assumptions = assumptions or _load_assumptions()
+    return assumptions["short_session_threshold_hours"]
+
+
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -186,12 +235,13 @@ def _latest_sync(conn: sqlite3.Connection) -> Optional[sqlite3.Row]:
     ).fetchone()
 
 
-def _sync_is_fresh(snapshot: Optional[sqlite3.Row]) -> bool:
+def _sync_is_fresh(snapshot: Optional[sqlite3.Row], assumptions: Optional[dict] = None) -> bool:
     """True if snapshot exists and synced_at is within 2 hours of now."""
     if snapshot is None:
         return False
+    assumptions = assumptions or _load_assumptions()
     synced_at = datetime.fromisoformat(snapshot["synced_at"])
-    return (_now_utc() - synced_at).total_seconds() < 7200
+    return (_now_utc() - synced_at).total_seconds() < assumptions["fresh_sync_hours"] * 3600
 
 
 # ── Plan capacity estimates ───────────────────────────────────────────────────
@@ -219,6 +269,25 @@ ESTIMATE_SIZE_DESC = {
 
 DEFAULT_MSG_RATE = 10  # fallback msg/hr when no history
 
+DEFAULT_ASSUMPTIONS = {
+    "session_hours": SESSION_HOURS,
+    "peak_penalty": 0.75,
+    "default_msg_rate": DEFAULT_MSG_RATE,
+    "short_session_threshold_hours": 4.0,
+    "fresh_sync_hours": 2.0,
+    "weekly_warning_threshold": 0.8,
+    "weekly_sessions": PLAN_WEEKLY_SESSIONS.copy(),
+}
+
+ASSUMPTION_FIELDS = {
+    "session_hours": "Hours in one rolling session window",
+    "peak_penalty": "Effective capacity multiplier during peak hours",
+    "default_msg_rate": "Fallback messages/hour when no history exists",
+    "short_session_threshold_hours": "Completed sessions below this count as short",
+    "fresh_sync_hours": "How long synced Usage-page data stays fresh",
+    "weekly_warning_threshold": "Weekly budget warning threshold as a decimal",
+}
+
 # ── Commands ──────────────────────────────────────────────────────────────────
 
 @app.command("start")
@@ -231,15 +300,17 @@ def start_session(
     """Start a new Claude session and begin tracking it."""
     conn = _db()
     cfg = _load_config()
+    assumptions = _load_assumptions(cfg)
+    session_hours = assumptions["session_hours"]
 
     active = _active_session(conn)
     if active:
         duration = _session_duration_hrs(active)
-        remaining = max(0, SESSION_HOURS - duration)
+        remaining = max(0, session_hours - duration)
         console.print(Panel(
             f"[yellow]Session already active:[/yellow] [bold]{active['label'] or 'unlabeled'}[/bold]\n"
             f"Started: {active['started_at'][:16]} UTC\n"
-            f"Running: [cyan]{duration:.1f}h[/cyan] / {SESSION_HOURS}h  |  "
+            f"Running: [cyan]{duration:.1f}h[/cyan] / {session_hours:g}h  |  "
             f"[green]{remaining:.1f}h remaining[/green]\n\n"
             f"Run [bold]claude-budget end[/bold] to close it first.",
             title="⚠ Active Session", border_style="yellow"
@@ -260,7 +331,7 @@ def start_session(
         peak_warning = "\n[red bold]⚡ PEAK HOURS[/red bold] (5am-11am PT) - sessions drain [bold]faster[/bold] right now. Consider waiting."
 
     sessions_this_week = _sessions_this_week(conn)
-    plan_sessions = PLAN_WEEKLY_SESSIONS.get(cfg["plan"], 50)
+    plan_sessions = _plan_weekly_sessions(cfg["plan"], assumptions)
     used = len(sessions_this_week)
     pct = min(100, int(used / plan_sessions * 100))
     budget_bar = _make_bar(pct, 30)
@@ -269,7 +340,7 @@ def start_session(
     console.print(Panel(
         f"[green bold]✓ Session started[/green bold]  [dim]{now.strftime('%Y-%m-%d %H:%M')} UTC  ({display_time.strftime('%I:%M%p')} {_tz_label(cfg)})[/dim]\n"
         f"Label: [cyan]{label or 'unlabeled'}[/cyan]  |  Task: [cyan]{task or 'general'}[/cyan]\n"
-        f"Window: [bold]{SESSION_HOURS}h[/bold] rolling{peak_warning}\n\n"
+        f"Window: [bold]{session_hours:g}h[/bold] rolling{peak_warning}\n\n"
         f"Weekly sessions used: {budget_bar}  {used}/{plan_sessions} est. ({pct}%)",
         title="🟢 Session Started", border_style="green"
     ))
@@ -283,6 +354,8 @@ def end_session(
 ):
     """End the current session and log usage."""
     conn = _db()
+    assumptions = _load_assumptions()
+    session_hours = assumptions["session_hours"]
     active = _active_session(conn)
 
     if not active:
@@ -291,7 +364,7 @@ def end_session(
 
     now = _now_utc()
     duration = _session_duration_hrs(active)
-    remaining_was = max(0, SESSION_HOURS - duration)
+    remaining_was = max(0, session_hours - duration)
 
     conn.execute(
         "UPDATE sessions SET ended_at=?, messages=?, tokens_est=?, notes=? WHERE id=?",
@@ -306,7 +379,7 @@ def end_session(
 
     console.print(Panel(
         f"[bold]Session:[/bold] {active['label']}\n"
-        f"Duration: [cyan]{duration:.2f}h[/cyan] / {SESSION_HOURS}h  |  "
+        f"Duration: [cyan]{duration:.2f}h[/cyan] / {session_hours:g}h  |  "
         f"Remaining unused: [yellow]{remaining_was:.2f}h[/yellow]\n"
         f"Messages: [cyan]{messages}[/cyan]  |  "
         f"Tokens est: [cyan]{tokens:,}[/cyan]  |  "
@@ -326,12 +399,15 @@ def status(verbose: bool = typer.Option(False, "--verbose", "-v")):
     """Show current session status and weekly budget at a glance."""
     conn = _db()
     cfg = _load_config()
+    assumptions = _load_assumptions(cfg)
+    session_hours = assumptions["session_hours"]
+    short_threshold = _short_session_threshold(assumptions)
     now = _now_utc()
 
     active = _active_session(conn)
     sessions_week = _sessions_this_week(conn)
     plan = cfg.get("plan", "max_5x")
-    plan_sessions = PLAN_WEEKLY_SESSIONS.get(plan, 50)
+    plan_sessions = _plan_weekly_sessions(plan, assumptions)
 
     # ── Weekly summary ──────────────────────────────────────────
     total_sessions = len(sessions_week)
@@ -341,8 +417,8 @@ def status(verbose: bool = typer.Option(False, "--verbose", "-v")):
 
     # Wasted sessions: ended before 4h (left >1h on table)
     completed = [s for s in sessions_week if s["ended_at"]]
-    wasted = [s for s in completed if _session_duration_hrs(s) < (SESSION_HOURS - 1.0)]
-    wasted_hrs = sum(SESSION_HOURS - _session_duration_hrs(s) for s in wasted)
+    wasted = [s for s in completed if _session_duration_hrs(s) < short_threshold]
+    wasted_hrs = sum(session_hours - _session_duration_hrs(s) for s in wasted)
 
     # Peak vs off-peak
     peak_sessions = sum(1 for s in sessions_week if s["peak_hour"])
@@ -350,7 +426,7 @@ def status(verbose: bool = typer.Option(False, "--verbose", "-v")):
 
     # ── Sync overlay ──────────────────────────────────────────────
     latest_sync = _latest_sync(conn)
-    sync_fresh = _sync_is_fresh(latest_sync)
+    sync_fresh = _sync_is_fresh(latest_sync, assumptions)
     sync_ago_min = None
     if sync_fresh:
         sync_ago_min = int((_now_utc() - datetime.fromisoformat(latest_sync["synced_at"])).total_seconds() / 60)
@@ -358,8 +434,8 @@ def status(verbose: bool = typer.Option(False, "--verbose", "-v")):
     # ── Active session panel ─────────────────────────────────────
     if active:
         dur = _session_duration_hrs(active)
-        remaining = max(0, SESSION_HOURS - dur)
-        pct_session = min(100, int(dur / SESSION_HOURS * 100))
+        remaining = max(0, session_hours - dur)
+        pct_session = min(100, int(dur / session_hours * 100))
         peak_now = _is_peak(now, cfg.get("timezone_offset", 0))
         peak_flag = " [red bold]⚡ PEAK[/red bold]" if peak_now else " [green]✓ off-peak[/green]"
 
@@ -382,7 +458,7 @@ def status(verbose: bool = typer.Option(False, "--verbose", "-v")):
             console.print(Panel(
                 f"[bold]{active['label']}[/bold]  [{active['task_type']}]{peak_flag}\n"
                 f"Started: {active['started_at'][:16]} UTC  ({started_local.strftime('%I:%M%p')} {_tz_label(cfg)})\n"
-                f"Elapsed: {_make_bar(pct_session, 25)} [cyan]{dur:.1f}h[/cyan] / {SESSION_HOURS}h\n"
+                f"Elapsed: {_make_bar(pct_session, 25)} [cyan]{dur:.1f}h[/cyan] / {session_hours:g}h\n"
                 f"Remaining: [green bold]{remaining:.1f}h[/green bold]",
                 title="Active Session", border_style="green"
             ))
@@ -476,6 +552,8 @@ def dashboard(
     """Show visual usage charts for recent sessions."""
     conn = _db()
     cfg = _load_config()
+    assumptions = _load_assumptions(cfg)
+    short_threshold = _short_session_threshold(assumptions)
     cutoff = (_now_utc() - timedelta(days=days)).isoformat()
 
     if project:
@@ -512,7 +590,7 @@ def dashboard(
     total_tokens = sum(s["tokens_est"] or 0 for s in sessions)
     completed = [s for s in sessions if s["ended_at"]]
     active = [s for s in sessions if not s["ended_at"]]
-    short = [s for s in completed if _session_duration_hrs(s) < (SESSION_HOURS - 1.0)]
+    short = [s for s in completed if _session_duration_hrs(s) < short_threshold]
     used_well = len(completed) - len(short)
     peak = sum(1 for s in sessions if s["peak_hour"])
     offpeak = total_sessions - peak
@@ -572,6 +650,8 @@ def projects(
 ):
     """Summarize usage by project tag."""
     conn = _db()
+    assumptions = _load_assumptions()
+    short_threshold = _short_session_threshold(assumptions)
     cutoff = (_now_utc() - timedelta(days=days)).isoformat()
     sessions = conn.execute(
         "SELECT * FROM sessions WHERE started_at > ? ORDER BY started_at DESC", (cutoff,)
@@ -610,7 +690,7 @@ def projects(
             duration = _session_duration_hrs(s)
             item["duration"] += duration
             item["completed"] += 1
-            if duration < (SESSION_HOURS - 1.0):
+            if duration < short_threshold:
                 item["short"] += 1
 
     project_names = ", ".join(sorted(grouped.keys()))
@@ -653,20 +733,23 @@ def doctor():
     """Check tracking setup and flag usage data issues."""
     conn = _db()
     cfg = _load_config()
+    assumptions = _load_assumptions(cfg)
+    session_hours = assumptions["session_hours"]
+    short_threshold = _short_session_threshold(assumptions)
     now = _now_utc()
     sessions_week = _sessions_this_week(conn)
     active = _active_session(conn)
     latest_sync = _latest_sync(conn)
     completed = [s for s in sessions_week if s["ended_at"]]
-    short = [s for s in completed if _session_duration_hrs(s) < (SESSION_HOURS - 1.0)]
+    short = [s for s in completed if _session_duration_hrs(s) < short_threshold]
     with_messages = [s for s in completed if (s["messages"] or 0) > 0]
     peak_sessions = sum(1 for s in sessions_week if s["peak_hour"])
 
     checks = []
 
     plan = cfg.get("plan")
-    if plan in PLAN_WEEKLY_SESSIONS:
-        checks.append(("[green]OK[/green]", f"Plan configured: {PLAN_LABELS.get(plan, plan)}"))
+    if plan in assumptions["weekly_sessions"]:
+        checks.append(("[green]OK[/green]", f"Plan configured: {PLAN_LABELS.get(plan, plan)} ({_plan_weekly_sessions(plan, assumptions)} sessions/week)"))
     else:
         checks.append(("[red]Fix[/red]", "Unknown plan in config. Run [bold]claude-budget config --plan max_5x[/bold]."))
 
@@ -678,17 +761,17 @@ def doctor():
 
     if active:
         duration = _session_duration_hrs(active)
-        if duration > SESSION_HOURS + 0.25:
+        if duration > session_hours + 0.25:
             checks.append(("[yellow]Check[/yellow]", f"Active session has been open for {duration:.1f}h. Run [bold]claude-budget end[/bold] if it is stale."))
         else:
-            checks.append(("[green]OK[/green]", f"Active session is {duration:.1f}h into the {SESSION_HOURS}h window."))
+            checks.append(("[green]OK[/green]", f"Active session is {duration:.1f}h into the {session_hours:g}h window."))
     else:
         checks.append(("[dim]Info[/dim]", "No active session right now."))
 
     if latest_sync:
         synced_at = datetime.fromisoformat(latest_sync["synced_at"])
         sync_age = (now - synced_at).total_seconds() / 3600
-        if _sync_is_fresh(latest_sync):
+        if _sync_is_fresh(latest_sync, assumptions):
             checks.append(("[green]OK[/green]", f"Usage sync is fresh ({sync_age * 60:.0f}m old)."))
         else:
             checks.append(("[yellow]Check[/yellow]", f"Usage sync is stale ({sync_age:.1f}h old). Run [bold]claude-budget sync[/bold] for live percentages."))
@@ -739,6 +822,7 @@ def forecast(
     """Forecast when current pace hits weekly budget thresholds."""
     conn = _db()
     cfg = _load_config()
+    assumptions = _load_assumptions(cfg)
     now = _now_utc()
     cutoff = (now - timedelta(days=days)).isoformat()
     sessions = conn.execute(
@@ -756,15 +840,17 @@ def forecast(
     elapsed_days = max((now - oldest).total_seconds() / 86400, 0.1)
     sessions_per_day = len(sessions) / elapsed_days
     plan = cfg.get("plan", "max_5x")
-    plan_ceiling = PLAN_WEEKLY_SESSIONS.get(plan, 50)
+    plan_ceiling = _plan_weekly_sessions(plan, assumptions)
     reset_at = oldest + timedelta(days=7)
+    warning_threshold = assumptions["weekly_warning_threshold"]
 
     table = Table(box=box.SIMPLE_HEAVY, show_lines=False)
     table.add_column("Threshold", width=12)
     table.add_column("Sessions", justify="right", width=10)
     table.add_column("Forecast", min_width=32)
 
-    for label, pct in [("80%", 0.8), ("100%", 1.0)]:
+    threshold_label = f"{warning_threshold * 100:.0f}%"
+    for label, pct in [(threshold_label, warning_threshold), ("100%", 1.0)]:
         target = max(1, int(plan_ceiling * pct))
         if len(sessions) >= target:
             forecast_line = "[yellow]Already reached[/yellow]"
@@ -793,12 +879,70 @@ def forecast(
     console.print(table)
 
 
+@app.command("simulate")
+def simulate(
+    sessions_per_day: float = typer.Option(2.0, "--sessions-per-day", "-s", help="Hypothetical sessions used per day"),
+    days: int = typer.Option(7, "--days", "-d", help="How many days to simulate"),
+    plan: Optional[str] = typer.Option(None, "--plan", "-p", help="Plan to model: pro | max_5x | max_20x"),
+):
+    """Simulate weekly budget burn under a hypothetical pace."""
+    cfg = _load_config()
+    assumptions = _load_assumptions(cfg)
+    plan_name = plan or cfg.get("plan", "max_5x")
+    if plan_name not in assumptions["weekly_sessions"]:
+        console.print(f"[red]Unknown plan '{plan_name}'. Use: pro | max_5x | max_20x[/red]")
+        raise typer.Exit(1)
+
+    sessions_per_day = max(0.0, sessions_per_day)
+    days = max(1, days)
+    plan_ceiling = _plan_weekly_sessions(plan_name, assumptions)
+    warning_threshold = assumptions["weekly_warning_threshold"]
+    warning_target = plan_ceiling * warning_threshold
+    total_projected = sessions_per_day * days
+    safe_daily_pace = plan_ceiling / 7
+
+    def threshold_line(target: float) -> str:
+        if sessions_per_day <= 0:
+            return "[dim]Never at 0 sessions/day[/dim]"
+        days_until = target / sessions_per_day
+        if days_until > days:
+            return f"After simulated {days}d window"
+        return f"Day {days_until:.1f}"
+
+    table = Table(box=box.SIMPLE_HEAVY, show_lines=False)
+    table.add_column("Threshold", width=12)
+    table.add_column("Sessions", justify="right", width=10)
+    table.add_column("Hit time", min_width=24)
+    table.add_row(f"{warning_threshold * 100:.0f}%", f"{warning_target:.0f}/{plan_ceiling}", threshold_line(warning_target))
+    table.add_row("100%", f"{plan_ceiling}/{plan_ceiling}", threshold_line(plan_ceiling))
+
+    if total_projected > plan_ceiling:
+        verdict = "[red]Over budget[/red]"
+    elif total_projected >= warning_target:
+        verdict = "[yellow]Near budget[/yellow]"
+    else:
+        verdict = "[green]Comfortable[/green]"
+
+    console.print(Panel(
+        f"[bold]Plan:[/bold] {PLAN_LABELS.get(plan_name, plan_name)}\n"
+        f"[bold]Pace:[/bold] [cyan]{sessions_per_day:.1f}[/cyan] sessions/day for {days} day(s)\n"
+        f"[bold]Projected use:[/bold] [cyan]{total_projected:.1f}[/cyan] / {plan_ceiling} sessions\n"
+        f"[bold]Suggested max pace:[/bold] [cyan]{safe_daily_pace:.1f}[/cyan] sessions/day over 7 days\n"
+        f"[bold]Verdict:[/bold] {verdict}",
+        title="Simulation", border_style="cyan"
+    ))
+    console.print(table)
+
+
 @app.command("review")
 def review(
     days: int = typer.Option(7, "--days", "-d", help="How many days back to review"),
 ):
     """Review recent usage patterns and next actions."""
     conn = _db()
+    assumptions = _load_assumptions()
+    session_hours = assumptions["session_hours"]
+    short_threshold = _short_session_threshold(assumptions)
     cutoff = (_now_utc() - timedelta(days=days)).isoformat()
     sessions = conn.execute(
         "SELECT * FROM sessions WHERE started_at > ? ORDER BY started_at DESC", (cutoff,)
@@ -812,8 +956,8 @@ def review(
         return
 
     completed = [s for s in sessions if s["ended_at"]]
-    short = [s for s in completed if _session_duration_hrs(s) < (SESSION_HOURS - 1.0)]
-    wasted_hrs = sum(SESSION_HOURS - _session_duration_hrs(s) for s in short)
+    short = [s for s in completed if _session_duration_hrs(s) < short_threshold]
+    wasted_hrs = sum(session_hours - _session_duration_hrs(s) for s in short)
     peak = sum(1 for s in sessions if s["peak_hour"])
     total_messages = sum(s["messages"] or 0 for s in sessions)
     total_tokens = sum(s["tokens_est"] or 0 for s in sessions)
@@ -861,12 +1005,15 @@ def advice():
     """Get personalised tips to stop wasting your weekly limit."""
     conn = _db()
     cfg = _load_config()
+    assumptions = _load_assumptions(cfg)
+    session_hours = assumptions["session_hours"]
+    short_threshold = _short_session_threshold(assumptions)
     sessions_week = _sessions_this_week(conn)
     now = _now_utc()
 
     completed = [s for s in sessions_week if s["ended_at"]]
-    wasted = [s for s in completed if _session_duration_hrs(s) < (SESSION_HOURS - 1.0)]
-    wasted_hrs = sum(SESSION_HOURS - _session_duration_hrs(s) for s in wasted)
+    wasted = [s for s in completed if _session_duration_hrs(s) < short_threshold]
+    wasted_hrs = sum(session_hours - _session_duration_hrs(s) for s in wasted)
     peak_sessions = sum(1 for s in sessions_week if s["peak_hour"])
     total = len(sessions_week)
 
@@ -889,8 +1036,8 @@ def advice():
     elif len(wasted) == 0 and peak_sessions < total * 0.3:
         tips.append("[green]✓ Solid usage pattern:[/green] You're using most of each session and avoiding peak hours.")
 
-    plan_sessions = PLAN_WEEKLY_SESSIONS.get(cfg.get("plan", "max_5x"), 50)
-    if total > plan_sessions * 0.8:
+    plan_sessions = _plan_weekly_sessions(cfg.get("plan", "max_5x"), assumptions)
+    if total > plan_sessions * assumptions["weekly_warning_threshold"]:
         tips.append(
             f"[yellow]● Budget warning:[/yellow] You've used ~{total}/{plan_sessions} estimated sessions this week. "
             "Prioritise high-value tasks for remaining sessions. Consider /clear between unrelated tasks instead of starting new sessions."
@@ -921,6 +1068,7 @@ def week():
     """Project your end-of-week budget based on current burn pace."""
     conn = _db()
     cfg = _load_config()
+    assumptions = _load_assumptions(cfg)
     now = _now_utc()
 
     sessions = _sessions_this_week(conn)
@@ -954,13 +1102,14 @@ def week():
     projected_total = total_used + avg_per_day * days_until_reset
 
     plan = cfg.get("plan", "max_5x")
-    plan_ceiling = PLAN_WEEKLY_SESSIONS.get(plan, 50)
+    plan_ceiling = _plan_weekly_sessions(plan, assumptions)
     projected_remaining = max(0, plan_ceiling - projected_total)
 
     pct_projected = projected_total / plan_ceiling * 100
 
     warning = ""
-    if pct_projected > 80:
+    warning_pct = assumptions["weekly_warning_threshold"] * 100
+    if pct_projected > warning_pct:
         warning = (
             f"\n[red bold]⚠ Warning:[/red bold] At this pace you'll use "
             f"~{projected_total:.0f}/{plan_ceiling} sessions ({pct_projected:.0f}%) by reset day."
@@ -1045,11 +1194,13 @@ def estimate(
     """Estimate questions remaining in the current session window."""
     conn = _db()
     cfg = _load_config()
+    assumptions = _load_assumptions(cfg)
+    session_hours = assumptions["session_hours"]
     now = _now_utc()
 
     # Step 1 - time remaining
     latest_sync = _latest_sync(conn)
-    sync_fresh = _sync_is_fresh(latest_sync)
+    sync_fresh = _sync_is_fresh(latest_sync, assumptions)
 
     active = _active_session(conn)
     if sync_fresh and latest_sync["session_expires_at"]:
@@ -1059,11 +1210,11 @@ def estimate(
         time_line = f"Active session: [cyan]{time_remaining:.1f}h[/cyan] remaining\n[dim]Session time from last sync ({sync_ago}m ago)[/dim]"
     elif active:
         elapsed = _session_duration_hrs(active)
-        time_remaining = max(0, SESSION_HOURS - elapsed)
+        time_remaining = max(0, session_hours - elapsed)
         time_line = f"Active session: [cyan]{time_remaining:.1f}h[/cyan] remaining"
     else:
-        time_remaining = SESSION_HOURS
-        time_line = f"No active session - full [cyan]{SESSION_HOURS}h[/cyan] available"
+        time_remaining = session_hours
+        time_line = f"No active session - full [cyan]{session_hours:g}h[/cyan] available"
 
     # Step 2 - historical message rate
     sessions_week = _sessions_this_week(conn)
@@ -1075,14 +1226,15 @@ def estimate(
         avg_msgs_per_hr = total_msgs / total_dur
         rate_line = f"Your rate: [cyan]{avg_msgs_per_hr:.1f}[/cyan] msg/hr (7-day history)"
     else:
-        avg_msgs_per_hr = DEFAULT_MSG_RATE
-        rate_line = f"Using default: [cyan]{DEFAULT_MSG_RATE}[/cyan] msg/hr (no history yet)"
+        avg_msgs_per_hr = assumptions["default_msg_rate"]
+        rate_line = f"Using default: [cyan]{avg_msgs_per_hr:g}[/cyan] msg/hr (no history yet)"
 
     # Step 3 - peak hour penalty
     peak_line = ""
     if _is_peak(now, cfg.get("timezone_offset", 0)):
-        effective_time = time_remaining * 0.75
-        peak_line = f"\n[red bold]Peak hours[/red bold] - effective time reduced to [cyan]{effective_time:.1f}h[/cyan] (0.75x penalty)"
+        peak_penalty = assumptions["peak_penalty"]
+        effective_time = time_remaining * peak_penalty
+        peak_line = f"\n[red bold]Peak hours[/red bold] - effective time reduced to [cyan]{effective_time:.1f}h[/cyan] ({peak_penalty:g}x penalty)"
     else:
         effective_time = time_remaining
 
@@ -1134,11 +1286,14 @@ def plan_cmd():
     """Plan your next session to avoid wasting budget on peak hours."""
     conn = _db()
     cfg = _load_config()
+    assumptions = _load_assumptions(cfg)
+    session_hours = assumptions["session_hours"]
+    peak_penalty = assumptions["peak_penalty"]
     now = _now_utc()
 
     # Step 1 — current session state
     latest_sync = _latest_sync(conn)
-    sync_fresh = _sync_is_fresh(latest_sync)
+    sync_fresh = _sync_is_fresh(latest_sync, assumptions)
 
     active = _active_session(conn)
     if sync_fresh and latest_sync["session_expires_at"]:
@@ -1153,7 +1308,7 @@ def plan_cmd():
         )
     elif active:
         started = datetime.fromisoformat(active["started_at"])
-        next_window_start = started + timedelta(hours=SESSION_HOURS)
+        next_window_start = started + timedelta(hours=session_hours)
         remaining = max(0, (next_window_start - now).total_seconds() / 3600)
         display_expires = _to_display_tz(next_window_start, cfg)
         state_line = (
@@ -1167,10 +1322,10 @@ def plan_cmd():
     # Step 2 — generate 4 candidate windows
     windows = []
     for i in range(4):
-        w_start = next_window_start + timedelta(hours=5 * i)
-        w_end = w_start + timedelta(hours=SESSION_HOURS)
+        w_start = next_window_start + timedelta(hours=session_hours * i)
+        w_end = w_start + timedelta(hours=session_hours)
         overlap = _peak_overlap_hours(w_start, w_end)
-        effective = 5.0 - (overlap * 0.25)
+        effective = session_hours - (overlap * (1 - peak_penalty))
 
         if overlap == 0:
             rating, color, icon = "IDEAL", "green", "✓"
@@ -1197,7 +1352,7 @@ def plan_cmd():
     table.add_column("Effective hrs", justify="right", width=14)
     table.add_column("Rating", width=10)
 
-    labels = ["Next", "+5h", "+10h", "+15h"]
+    labels = ["Next", f"+{session_hours:g}h", f"+{session_hours * 2:g}h", f"+{session_hours * 3:g}h"]
     for label, w in zip(labels, windows):
         dt = w["display_dt"]
         # Format: "Mon 10:00pm (UTC-4)"
@@ -1225,12 +1380,12 @@ def plan_cmd():
 
     # Step 5 — recommendation
     if not active and windows[0]["rating"] == "IDEAL":
-        rec_line = "[green]Start now[/green] — you're off-peak, full 5h window available."
+        rec_line = f"[green]Start now[/green] — you're off-peak, full {session_hours:g}h window available."
     elif not active and windows[0]["rating"] == "AVOID":
         time_to_best = (best["start_utc"] - now).total_seconds() / 3600
         hrs = int(time_to_best)
         mins = int((time_to_best - hrs) * 60)
-        lost = 5.0 - windows[0]["effective"]
+        lost = session_hours - windows[0]["effective"]
         rec_line = (
             f"[yellow]Wait[/yellow] — starting now costs you ~{lost:.1f}h of effective time. "
             f"Next IDEAL window in {hrs}h {mins}m."
@@ -1245,7 +1400,7 @@ def plan_cmd():
 
     # Step 6 — weekly budget
     plan = cfg.get("plan", "max_5x")
-    plan_ceiling = PLAN_WEEKLY_SESSIONS.get(plan, 50)
+    plan_ceiling = _plan_weekly_sessions(plan, assumptions)
     sessions_left = max(0, plan_ceiling - len(_sessions_this_week(conn)))
     budget_line = f"Weekly budget: [cyan]{sessions_left}[/cyan] sessions remaining (estimated)"
 
@@ -1421,6 +1576,101 @@ def sync_cmd(
         _sync_confirmation_panel(session_pct, weekly_pct, session_expires_at, weekly_resets_text, "paste", cfg)
 
 
+@app.command("assumptions")
+def assumptions_cmd(
+    set_value: Optional[str] = typer.Option(None, "--set", help="Set an assumption, e.g. peak_penalty=0.65 or weekly_sessions.pro=12"),
+    load_file: Optional[str] = typer.Option(None, "--load", help="Load assumptions from a JSON file"),
+    reset: bool = typer.Option(False, "--reset", help="Reset assumptions to defaults"),
+):
+    """View or tune local forecasting assumptions."""
+    if load_file and set_value:
+        console.print("[red]Use either --load or --set, not both.[/red]")
+        raise typer.Exit(1)
+
+    if reset:
+        _save_assumptions({
+            **DEFAULT_ASSUMPTIONS,
+            "weekly_sessions": DEFAULT_ASSUMPTIONS["weekly_sessions"].copy(),
+        })
+        console.print(Panel(
+            "Assumptions reset to defaults.",
+            title="Assumptions", border_style="green"
+        ))
+        return
+
+    if load_file:
+        path = Path(load_file).expanduser()
+        if not path.exists():
+            console.print(f"[red]Assumptions file not found: {path}[/red]")
+            raise typer.Exit(1)
+        try:
+            with open(path) as f:
+                loaded = json.load(f)
+        except json.JSONDecodeError as exc:
+            console.print(f"[red]Could not parse JSON: {exc}[/red]")
+            raise typer.Exit(1)
+
+        loaded_assumptions = loaded.get("assumptions", loaded)
+        assumptions = _load_assumptions({"assumptions": loaded_assumptions})
+        _save_assumptions(assumptions)
+        console.print(Panel(
+            f"Loaded assumptions from [cyan]{path}[/cyan].",
+            title="Assumptions", border_style="green"
+        ))
+
+    if set_value:
+        if "=" not in set_value:
+            console.print("[red]Use --set key=value, for example --set peak_penalty=0.65[/red]")
+            raise typer.Exit(1)
+        key, raw_value = [part.strip() for part in set_value.split("=", 1)]
+        assumptions = _load_assumptions()
+
+        if key.startswith("weekly_sessions."):
+            plan_name = key.split(".", 1)[1]
+            if plan_name not in PLAN_WEEKLY_SESSIONS:
+                console.print(f"[red]Unknown plan '{plan_name}'. Use: pro | max_5x | max_20x[/red]")
+                raise typer.Exit(1)
+            try:
+                assumptions["weekly_sessions"][plan_name] = max(1, int(raw_value))
+            except ValueError:
+                console.print("[red]Weekly session values must be whole numbers.[/red]")
+                raise typer.Exit(1)
+        elif key in ASSUMPTION_FIELDS:
+            try:
+                assumptions[key] = float(raw_value)
+            except ValueError:
+                console.print(f"[red]{key} must be a number.[/red]")
+                raise typer.Exit(1)
+        else:
+            valid = ", ".join(list(ASSUMPTION_FIELDS.keys()) + [f"weekly_sessions.{p}" for p in PLAN_WEEKLY_SESSIONS])
+            console.print(f"[red]Unknown assumption '{key}'. Valid keys: {valid}[/red]")
+            raise typer.Exit(1)
+
+        _save_assumptions(_load_assumptions({"assumptions": assumptions}))
+        console.print(Panel(
+            f"Set [bold]{key}[/bold] to [cyan]{raw_value}[/cyan].",
+            title="Assumptions", border_style="green"
+        ))
+
+    assumptions = _load_assumptions()
+    table = Table(box=box.SIMPLE_HEAVY, show_lines=False)
+    table.add_column("Key", style="cyan", min_width=28)
+    table.add_column("Value", justify="right", width=12)
+    table.add_column("Meaning", min_width=42)
+
+    for key, meaning in ASSUMPTION_FIELDS.items():
+        table.add_row(key, f"{assumptions[key]:g}", meaning)
+    for plan_name, count in assumptions["weekly_sessions"].items():
+        table.add_row(f"weekly_sessions.{plan_name}", str(count), f"Estimated weekly sessions for {PLAN_LABELS.get(plan_name, plan_name)}")
+
+    console.print(Panel(
+        f"Config: [dim]{CONFIG_PATH}[/dim]\n"
+        "Tune with [bold]claude-budget assumptions --set key=value[/bold].",
+        title="Assumptions", border_style="cyan"
+    ))
+    console.print(table)
+
+
 @app.command("config")
 def config_cmd(
     plan: Optional[str] = typer.Option(None, "--plan", "-p", help="pro | max_5x | max_20x"),
@@ -1484,13 +1734,15 @@ def optimize_cmd(
     """Generate an optimal schedule to maximize remaining sessions before reset."""
     conn = _db()
     cfg = _load_config()
+    assumptions = _load_assumptions(cfg)
+    session_hours = assumptions["session_hours"]
     now = _now_utc()
     plan = cfg.get("plan", "max_5x")
-    plan_ceiling = PLAN_WEEKLY_SESSIONS.get(plan, 50)
+    plan_ceiling = _plan_weekly_sessions(plan, assumptions)
 
     # Step 1 — sessions remaining
     latest_sync = _latest_sync(conn)
-    sync_fresh = _sync_is_fresh(latest_sync)
+    sync_fresh = _sync_is_fresh(latest_sync, assumptions)
 
     if sessions is not None:
         sessions_remaining = sessions
@@ -1530,7 +1782,7 @@ def optimize_cmd(
 
     # Step 4 — feasibility check
     hours_until_reset = time_until_reset.total_seconds() / 3600
-    max_possible = floor(hours_until_reset / SESSION_HOURS)
+    max_possible = floor(hours_until_reset / session_hours)
 
     if sessions_remaining == 0:
         console.print(Panel(
@@ -1548,7 +1800,7 @@ def optimize_cmd(
 
     if sessions_remaining <= 0:
         console.print(Panel(
-            f"Only {hours_until_reset:.1f}h until reset — not enough time for a full {SESSION_HOURS}h session.",
+            f"Only {hours_until_reset:.1f}h until reset — not enough time for a full {session_hours:g}h session.",
             title="Optimize", border_style="dim"
         ))
         return
@@ -1557,7 +1809,7 @@ def optimize_cmd(
     active = _active_session(conn)
     if active:
         started = datetime.fromisoformat(active["started_at"])
-        current_start = started + timedelta(hours=SESSION_HOURS)
+        current_start = started + timedelta(hours=session_hours)
         if current_start < now:
             current_start = now
     else:
@@ -1576,7 +1828,7 @@ def optimize_cmd(
                 pt_target += timedelta(days=1)
             candidate = pt_target + timedelta(hours=7)  # PT to UTC
 
-        slot_end = candidate + timedelta(hours=SESSION_HOURS)
+        slot_end = candidate + timedelta(hours=session_hours)
 
         if slot_end > reset_datetime:
             break
@@ -1628,7 +1880,7 @@ def optimize_cmd(
             str(i),
             f"{start_disp.strftime('%a %I:%M %p').lstrip('0')} {_tz_label(cfg)}",
             f"{end_disp.strftime('%a %I:%M %p').lstrip('0')} {_tz_label(cfg)}",
-            f"{SESSION_HOURS}.0h",
+            f"{session_hours:g}h",
             f"[{color}]{slot['rating']} {icon}[/{color}]",
         )
 
@@ -1706,6 +1958,8 @@ def _make_count_bar(value: int, max_value: int, width: int = 18, style: str = "c
 
 
 def _show_session_table(sessions: list, title: str = "Sessions"):
+    assumptions = _load_assumptions()
+    short_threshold = _short_session_threshold(assumptions)
     table = Table(title=title, box=box.SIMPLE_HEAVY, show_lines=False)
     table.add_column("#", style="dim", width=4)
     table.add_column("Label", style="cyan", max_width=20)
@@ -1719,10 +1973,9 @@ def _show_session_table(sessions: list, title: str = "Sessions"):
 
     for i, s in enumerate(sessions, 1):
         dur = _session_duration_hrs(s)
-        remaining = SESSION_HOURS - dur
         status_str = (
             "[green]active[/green]" if not s["ended_at"]
-            else "[red]short[/red]" if dur < SESSION_HOURS - 1.0
+            else "[red]short[/red]" if dur < short_threshold
             else "[dim]done[/dim]"
         )
         peak_str = "[red]●[/red]" if s["peak_hour"] else "[green]✓[/green]"
