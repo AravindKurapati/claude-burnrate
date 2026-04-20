@@ -1,4 +1,4 @@
-# claude-budget $$
+# claude-budget
 
 > **Stop losing 10-15% of your weekly Claude limit to wasted sessions.**
 
@@ -25,8 +25,8 @@ pip install claude-budget
 
 Or from source:
 ```bash
-git clone https://github.com/AravindKurapati/claude-budget
-cd claude-budget
+git clone https://github.com/AravindKurapati/claude-burnrate
+cd claude-burnrate
 pip install -e .
 ```
 
@@ -68,10 +68,10 @@ claude-budget advice
 
 Output example:
 ```
-💡 Short sessions: You left ~3.2h unused across 2 sessions. Front-load heavier
+ Short sessions: You left ~3.2h unused across 2 sessions. Front-load heavier
    tasks so each 5h window is fully used.
 
-⚡ Peak hours: 4/7 sessions were during peak (5am-11am PT). Shifting heavy
+ Peak hours: 4/7 sessions were during peak (5am-11am PT). Shifting heavy
    sessions to evenings gives you the same window but it drains slower.
 ```
 
@@ -93,10 +93,13 @@ claude-budget config --show
 
 | Command | What it does |
 |---------|-------------|
-| `start` | Begin tracking a new session |
+| `start` | Begin tracking a new session (`--project` to tag) |
 | `end` | Close session, log messages + token estimate |
 | `status` | Current session + weekly budget at a glance |
-| `history` | Session log for last N days |
+| `history` | Session log for last N days (`--project` to filter) |
+| `week` | Project end-of-week budget based on burn pace |
+| `estimate` | Estimate questions remaining by size and model |
+| `export` | Export session history to CSV |
 | `advice` | Personalised tips based on your usage patterns |
 | `config` | Set plan and timezone |
 | `reset` | Wipe history (keeps config) |
@@ -133,7 +136,6 @@ From the `advice` command, and from building this tool:
 5. **Use sub-agents for research** - Claude Code sub-agents do research without bloating your main context window.
 
 ---
-
 
 PRs welcome. If you've found other patterns that reduce waste, open an issue.
 

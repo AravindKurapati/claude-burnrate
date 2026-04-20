@@ -1,0 +1,29 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls:*)",
+      "Bash(python -m pytest test_cli.py::TestWeekCommand -v)",
+      "Bash(pip install:*)",
+      "Bash(python -c \"from pathlib import Path; print\\([f.name for f in Path\\('.'\\).glob\\('*.py'\\)]\\)\")",
+      "Bash(python -c \"import os; print\\([f for f in os.listdir\\('.'\\) if f.endswith\\('.py'\\)]\\)\")",
+      "Bash(python cli.py week)",
+      "Bash(python -m pytest test_cli.py::TestExportCommand -v)",
+      "Bash(python cli.py export --days 7)",
+      "Bash(python cli.py start -l \"test-export\" -t coding)",
+      "Bash(python -m pytest test_cli.py -v)",
+      "Bash(python Cli.py estimate)",
+      "Bash(python Cli.py estimate --size large)",
+      "Bash(python -m pytest test_cli.py::TestEstimateCommand -v)",
+      "Bash(python -c \"import Cli; print\\('ok'\\)\")",
+      "Bash(python Cli.py history --project nonexistent)",
+      "Bash(python seed_demo_data.py)",
+      "Bash(python Cli.py status -v)",
+      "Bash(python Cli.py history --project burnrate-build)",
+      "Bash(python -c ':*)",
+      "Bash(PYTHONIOENCODING=utf-8 python Cli.py status)",
+      "Bash(PYTHONIOENCODING=utf-8 python Cli.py history --days 7)",
+      "Bash(PYTHONIOENCODING=utf-8 python Cli.py export --days 7)",
+      "Bash(python -m pytest test_cli.py -q)"
+    ]
+  }
+}
