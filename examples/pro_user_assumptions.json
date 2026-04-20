@@ -1,0 +1,15 @@
+{
+  "assumptions": {
+    "session_hours": 5,
+    "peak_penalty": 0.75,
+    "default_msg_rate": 8,
+    "short_session_threshold_hours": 4,
+    "fresh_sync_hours": 2,
+    "weekly_warning_threshold": 0.8,
+    "weekly_sessions": {
+      "pro": 10,
+      "max_5x": 50,
+      "max_20x": 200
+    }
+  }
+}
