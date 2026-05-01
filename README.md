@@ -1,3 +1,7 @@
+
+
+https://github.com/user-attachments/assets/2d6e9fd6-e03c-4e23-834a-05243b3140c9
+
 # claude-burnrate
 
 > **Stop losing 10-15% of your weekly Claude limit to wasted sessions.**
