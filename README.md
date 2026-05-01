@@ -21,7 +21,10 @@ If you're careful all week but start sessions you don't finish, or accidentally 
 View a quick demo!
 
 
-https://github.com/user-attachments/assets/6df1df60-119a-47d9-9c4c-8e1b1873096c
+
+
+https://github.com/user-attachments/assets/421dd532-1a3d-4df1-8108-d6d3275f4d4d
+
 
 
 
