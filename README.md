@@ -1,5 +1,4 @@
-[claude-burnrate cinematic.html](https://github.com/user-attachments/files/27265102/claude-burnrate.cinematic.html)
-# claude-budget
+# claude-burnrate
 
 > **Stop losing 10-15% of your weekly Claude limit to wasted sessions.**
 
