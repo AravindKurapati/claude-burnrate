@@ -1994,5 +1994,54 @@ def _show_session_table(sessions: list, title: str = "Sessions"):
     console.print(table)
 
 
+@app.command("info")
+def info_cmd():
+    """Show version, DB location, current config, and command reference."""
+    from importlib.metadata import version as pkg_version, PackageNotFoundError
+    try:
+        v = pkg_version("claude-burnrate")
+    except PackageNotFoundError:
+        v = "dev"
+
+    cfg = _load_config()
+    db_size = DB_PATH.stat().st_size // 1024 if DB_PATH.exists() else 0
+    conn = _db()
+    total_sessions = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+    conn.close()
+
+    console.print(Panel(
+        f"[bold cyan]claude-burnrate[/bold cyan]  v{v}\n"
+        f"[dim]DB:[/dim] {DB_PATH}  [dim]({db_size} KB)[/dim]\n"
+        f"[dim]Plan:[/dim] {PLAN_LABELS.get(cfg['plan'], cfg['plan'])}  "
+        f"[dim]| TZ offset:[/dim] UTC{cfg['timezone_offset']:+d}  "
+        f"[dim]| Sessions recorded:[/dim] {total_sessions}",
+        title="claude-burnrate info",
+    ))
+
+    from rich.table import Table as RTable
+    cmds = RTable(show_header=False, box=None, padding=(0, 2))
+    cmds.add_column("cmd", style="cyan", no_wrap=True)
+    cmds.add_column("desc")
+    rows = [
+        ("claude-burnrate start [-l label]",    "Start a new session"),
+        ("claude-burnrate end",                 "End the active session"),
+        ("claude-burnrate status [-v]",         "Current session + weekly usage"),
+        ("claude-burnrate dashboard",           "Full burnrate dashboard"),
+        ("claude-burnrate week",                "Weekly summary"),
+        ("claude-burnrate history [-n N]",      "Past sessions table"),
+        ("claude-burnrate sync",                "Sync usage % from Claude UI"),
+        ("claude-burnrate forecast",            "Predict remaining capacity"),
+        ("claude-burnrate advice",              "Usage optimization tips"),
+        ("claude-burnrate plan",                "View/change plan config"),
+        ("claude-burnrate config",              "Show/edit all config"),
+        ("claude-burnrate export [-o file]",    "Export sessions as CSV/JSON"),
+        ("claude-burnrate doctor",              "Diagnose config issues"),
+        ("claude-burnrate reset --yes",         "Wipe all data"),
+    ]
+    for cmd, desc in rows:
+        cmds.add_row(cmd, desc)
+    console.print(cmds)
+
+
 if __name__ == "__main__":
     app()
