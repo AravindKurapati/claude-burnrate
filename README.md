@@ -152,6 +152,58 @@ PRs welcome. If you've found other patterns that reduce waste, open an issue.
 
 ---
 
+## Architecture
+
+```
+ claude-budget start / end / status / ...
+              |
+              v
+    +---------------------+
+    |    Typer CLI (cli.py)|
+    |    1800 LOC, single  |
+    |    module            |
+    +----------+----------+
+               |
+               v
+    +---------------------+
+    |  SQLite (usage.db)  |  ~/.claude_budget/usage.db
+    |  sessions table     |
+    |  sync table         |
+    +----------+----------+
+               |
+               v
+    +---------------------+
+    | Rich terminal UI    |
+    | progress bars,      |
+    | panels, tables      |
+    +---------------------+
+```
+
+---
+
+## Stack
+
+| Layer | Technology |
+|-------|------------|
+| Language | Python 3.9+ |
+| CLI framework | Typer + Rich |
+| Storage | SQLite (single file, local) |
+| Build | setuptools |
+| CI | GitHub Actions (pytest on every push/PR) |
+| Tests | pytest (59 tests covering all commands) |
+
+---
+
+## Limitations
+
+- **Manual token entry** - Anthropic does not expose token counts through claude.ai; you enter estimates when ending a session.
+- **No auto-detect of sessions** - you must run `start` and `end` manually (or via a hook) to track a session.
+- **Peak-hour model is approximate** - drain rates during peak hours are estimated based on community observations, not official Anthropic data.
+- **Single-machine only** - data lives in a local SQLite file; no sync across devices.
+- **Plan limits are estimates** - weekly session caps are based on community-reported numbers and may shift as Anthropic changes pricing.
+
+---
+
 ## License
 
 MIT
