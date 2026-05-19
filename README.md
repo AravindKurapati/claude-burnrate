@@ -160,8 +160,6 @@ PRs welcome. If you've found other patterns that reduce waste, open an issue.
               v
     +---------------------+
     |    Typer CLI (cli.py)|
-    |    1800 LOC, single  |
-    |    module            |
     +----------+----------+
                |
                v
@@ -190,7 +188,7 @@ PRs welcome. If you've found other patterns that reduce waste, open an issue.
 | Storage | SQLite (single file, local) |
 | Build | setuptools |
 | CI | GitHub Actions (pytest on every push/PR) |
-| Tests | pytest (59 tests covering all commands) |
+| Tests | pytest |
 
 ---
 
